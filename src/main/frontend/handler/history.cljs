@@ -1,74 +1,61 @@
-(ns frontend.handler.history
-  (:require [frontend.state :as state]
-            [frontend.db :as db]
-            [frontend.history :as history]
-            [frontend.handler.file :as file]
+(ns ^:no-doc frontend.handler.history
+  (:require [frontend.db :as db]
             [frontend.handler.editor :as editor]
-            [frontend.handler.ui :as ui-handler]
-            [promesa.core :as p]
-            [clojure.core.async :as async]
-            [goog.dom :as gdom]
-            [goog.object :as gobj]
-            [dommy.core :as d]
+            [frontend.modules.editor.undo-redo :as undo-redo]
+            [frontend.state :as state]
             [frontend.util :as util]
-            [medley.core :as medley]))
-
-(defn- default-undo
-  []
-  (js/document.execCommand "undo" false nil))
-
-(defn- default-redo
-  []
-  (js/document.execCommand "redo" false nil))
+            [frontend.handler.route :as route-handler]
+            [goog.dom :as gdom]))
 
 (defn restore-cursor!
-  [{:keys [block-container block-idx pos] :as state}]
-  (ui-handler/re-render-root!)
-  ;; get the element
-  (when (and block-container block-idx pos)
-    (when-let [container (gdom/getElement block-container)]
-      (let [blocks (d/by-class container "ls-block")
-            block-node (util/nth-safe (seq blocks) block-idx)
-            id (and block-node (gobj/get block-node "id"))]
-        (when id
-          (let [block-id (->> (take-last 36 id)
-                              (apply str))
-                block-uuid (when (util/uuid-string? block-id)
-                             (uuid block-id))]
-            (when block-uuid
-              (when-let [block (db/pull [:block/uuid block-uuid])]
-                (editor/edit-block! block pos
-                                    (:block/format block)
-                                    (:block/uuid block))))))))))
+  [{:keys [last-edit-block container pos]}]
+  (when (and container last-edit-block)
+    #_:clj-kondo/ignore
+    (when-let [container (gdom/getElement container)]
+      (when-let [block-uuid (:block/uuid last-edit-block)]
+        (when-let [block (db/pull [:block/uuid block-uuid])]
+          (editor/edit-block! block pos
+                              (:block/uuid block)
+                              {:custom-content (:block/content block)}))))))
+
+(defn- get-route-data
+  [route-match]
+  (when (seq route-match)
+    {:to (get-in route-match [:data :name])
+     :path-params (:path-params route-match)
+     :query-params (:query-params route-match)}))
+
+(defn restore-app-state!
+  [state]
+  (when-not (:history/page-only-mode? @state/state)
+   (let [route-match (:route-match state)
+         current-route (:route-match @state/state)
+         prev-route-data (get-route-data route-match)
+         current-route-data (get-route-data current-route)]
+     (when (and (not= prev-route-data current-route-data)
+                prev-route-data)
+       (route-handler/redirect! prev-route-data))
+     (swap! state/state merge state))))
 
 (defn undo!
-  []
-  (when-not (state/get-editor-op)
-    (let [route (get-in (:route-match @state/state) [:data :name])]
-      (if (and (contains? #{:home :page :file} route)
-               (state/get-current-repo))
-        (let [repo (state/get-current-repo)
-              chan (async/promise-chan)
-              save-commited? (atom nil)
-              undo-fn (fn []
-                        (history/undo! repo file/alter-file restore-cursor!))]
-          (editor/save-current-block-when-idle! {:check-idle? false
-                                                 :chan chan
-                                                 :chan-callback (fn []
-                                                                  (reset! save-commited? true))})
-          (if @save-commited?
-            (async/go
-              (let [_ (async/<! chan)]
-                (undo-fn)))
-            (undo-fn)))
-        (default-undo)))))
+  [e]
+  (util/stop e)
+  (state/set-editor-op! :undo)
+  (state/clear-editor-action!)
+  (state/set-block-op-type! nil)
+  (state/set-state! [:editor/last-replace-ref-content-tx (state/get-current-repo)] nil)
+  (editor/save-current-block!)
+  (let [{:keys [editor-cursor app-state]} (undo-redo/undo)]
+    (restore-cursor! editor-cursor)
+    (restore-app-state! app-state))
+  (state/set-editor-op! nil))
 
 (defn redo!
-  []
-  (when-not (state/get-editor-op)
-    (let [route (get-in (:route-match @state/state) [:data :name])]
-     (if (and (contains? #{:home :page :file} route)
-              (state/get-current-repo))
-       (let [repo (state/get-current-repo)]
-         (history/redo! repo file/alter-file restore-cursor!))
-       (default-redo)))))
+  [e]
+  (util/stop e)
+  (state/set-editor-op! :redo)
+  (state/clear-editor-action!)
+  (let [{:keys [editor-cursor app-state]} (undo-redo/redo)]
+    (restore-cursor! editor-cursor)
+    (restore-app-state! app-state))
+  (state/set-editor-op! nil))

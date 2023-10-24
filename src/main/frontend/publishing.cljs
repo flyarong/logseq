@@ -1,16 +1,27 @@
 (ns frontend.publishing
+  "Entry ns for publishing build. Provides frontend for publishing single page
+  application"
   (:require [frontend.state :as state]
             [datascript.core :as d]
             [frontend.db :as db]
-            [frontend.db-schema :as db-schema]
+            [logseq.db.schema :as db-schema]
             [rum.core :as rum]
-            [frontend.handler.route :as route]
+            [frontend.handler.route :as route-handler]
             [frontend.page :as page]
-            [frontend.util :as util]
+            [clojure.string :as string]
             [frontend.routes :as routes]
+            [frontend.context.i18n :as i18n]
             [reitit.frontend :as rf]
             [reitit.frontend.easy :as rfe]
-            [cljs.reader :as reader]))
+            [cljs.reader :as reader]
+            [frontend.components.block :as block]
+            [frontend.components.editor :as editor]
+            [frontend.components.page :as page-component]
+            [frontend.components.reference :as reference]
+            [frontend.components.whiteboard :as whiteboard]
+            [frontend.modules.shortcut.core :as shortcut]
+            [frontend.handler.events :as events]
+            [frontend.handler.command-palette :as command-palette]))
 
 ;; The publishing site should be as thin as possible.
 ;; Both files and git libraries can be removed.
@@ -25,13 +36,22 @@
 ;; 1. When you click a publish button, it'll downloads a zip which includes the
 ;;    html, css, javascript and other files (image, mp3, etc.), the serialized
 ;;    data should include all the public pages and blocks.
-;; 2. Built-in sync with Github Pages, you should specify a Github repo for publishing.
+;; 2. Built-in sync with GitHub Pages, you should specify a GitHub repo for publishing.
+
+(defn- unescape-html
+  [text]
+  (-> text
+      (string/replace "logseq____&amp;" "&")
+      (string/replace "logseq____&lt;" "<")
+      (string/replace "logseq____&gt;" ">")
+      (string/replace "logseq____&quot;" "\"")
+      (string/replace "logseq____&apos;" "'")))
 
 (defn restore-from-transit-str!
   []
   (state/set-current-repo! "local")
   (when-let [data js/window.logseq_db]
-    (let [data (util/unescape-html data)
+    (let [data (unescape-html data)
           db-conn (d/create-conn db-schema/schema)
           _ (swap! db/conns assoc "logseq-db/local" db-conn)
           db (db/string->db data)]
@@ -47,7 +67,7 @@
   []
   (rfe/start!
    (rf/router routes/routes {})
-   route/set-route-match!
+   route-handler/set-route-match!
    ;; set to false to enable HistoryAPI
    {:use-fragment true}))
 
@@ -56,12 +76,28 @@
     (set-router!)
     (rum/mount (page/current-page) node)))
 
+(defn- register-components-fns!
+  []
+  (state/set-page-blocks-cp! page-component/page-blocks-cp)
+  (state/set-component! :block/linked-references reference/block-linked-references)
+  (state/set-component! :whiteboard/tldraw-preview whiteboard/tldraw-preview)
+  (state/set-component! :block/single-block block/single-block-cp)
+  (state/set-component! :editor/box editor/box)
+  (command-palette/register-global-shortcut-commands))
+
 (defn ^:export init []
   ;; init is called ONCE when the page loads
   ;; this is called in the index.html and must be exported
   ;; so it is available even in :advanced release builds
+  (register-components-fns!)
+  ;; Set :preferred-lang as some components depend on it
+  (i18n/start)
   (restore-from-transit-str!)
   (restore-state!)
+  (shortcut/refresh!)
+  (events/run!)
+  ;; actually, there's no persist for publishing
+  (db/listen-and-persist! (state/get-current-repo))
   (start))
 
 (defn stop []

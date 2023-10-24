@@ -1,15 +1,10 @@
-(ns frontend.ui.date-picker
-  (:require
-   [rum.core :as rum]
-   [cljs-time.core       :refer [now today minus plus months days weeks year month day day-of-week first-day-of-the-month before? after?]]
-   [cljs-time.predicates :refer [sunday?]]
-   [cljs-time.format     :refer [parse unparse formatters formatter]]
-   [frontend.util          :refer [deref-or-value now->utc]]
-   [frontend.mixins :as mixins]
-   [frontend.util :as util]
-   [frontend.state :as state]
-   [goog.object :as gobj]
-   [clojure.string :as string]))
+(ns ^:no-doc frontend.ui.date-picker
+  (:require [cljs-time.core       :refer [after? before? day day-of-week days first-day-of-the-month minus month months plus year]]
+            [cljs-time.format     :refer [formatter unparse]]
+            [frontend.modules.shortcut.core :as shortcut]
+            [frontend.state :as state]
+            [frontend.util  :as util    :refer [deref-or-value now->utc]]
+            [rum.core :as rum]))
 
 ;; Adapted from re-com date-picker
 
@@ -23,12 +18,6 @@
 
 (def ^:const week-format (formatter "ww"))
 
-(def ^:const date-format (formatter "yyyy MMM dd"))
-
-(defn iso8601->date [iso8601]
-  (when (seq iso8601)
-    (parse (formatters :basic-date) iso8601)))
-
 (defn- month-label [date] (unparse month-format date))
 
 (defn- dec-month [date] (minus date (months 1)))
@@ -36,8 +25,6 @@
 (defn- inc-month [date] (plus date (months 1)))
 
 (defn- inc-date [date n] (plus date (days n)))
-
-(defn- inc-week [date n] (plus date (weeks n)))
 
 (defn previous
   "If date fails pred, subtract period until true, otherwise answer date"
@@ -87,7 +74,7 @@
 
 ;; ----------------------------------------------------------------------------
 
-(def *internal-model (atom nil))
+(def *internal-model (rum/cursor state/state :date-picker/date))
 
 (defn- main-div-with
   [table-div class style attr]
@@ -180,68 +167,15 @@
                         (constantly true))]
     (merge attributes {:selectable-fn selectable-fn})))
 
-;; TODO: find a better way
-(defn- non-edit-input?
-  []
-  (when-let [elem js/document.activeElement]
-    (and (util/input? elem)
-         (when-let [id (gobj/get elem "id")]
-           (not (string/starts-with? id "edit-block-"))))))
-
-(defn- input-or-select?
-  []
-  (when-let [elem js/document.activeElement]
-    (or (non-edit-input?)
-        (util/select? elem))))
-
-(defn- edit-input?
-  []
-  (when-let [elem js/document.activeElement]
-    (and (util/input? elem)
-         (when-let [id (gobj/get elem "id")]
-           (string/starts-with? id "edit-block-")))))
 
 (rum/defc date-picker < rum/reactive
-  (mixins/event-mixin
-   (fn [state]
-     (let [{:keys [on-change on-switch deadline-or-schedule?]} (last (:rum/args state))]
-       (mixins/on-key-down
-        state
-        {;; enter, current day
-         13 (fn [state e]
-              (when (and on-change
-                         (not (input-or-select?)))
-                (when-not deadline-or-schedule?
-                  (on-change e @*internal-model))))
-
-         ;; left, previous day
-         37 (fn [state e]
-              (when-not (input-or-select?)
-                (swap! *internal-model inc-date -1)))
-
-         ;; right, next day
-         39 (fn [state e]
-              (when-not (input-or-select?)
-                (swap! *internal-model inc-date 1)))
-
-         ;; up, one week ago
-         38 (fn [state e]
-              (when-not (input-or-select?)
-                (swap! *internal-model inc-week -1)))
-         ;; down, next week
-         40 (fn [state e]
-              (when-not (input-or-select?)
-                (swap! *internal-model inc-week 1)))}
-        {:all-handler (fn [e key-code]
-                        (when (and (contains? #{13 37 39 38 40} key-code)
-                                   (edit-input?))
-                          (util/stop e)))}))))
   {:init (fn [state]
            (reset! *internal-model (first (:rum/args state)))
            state)}
-  [model {:keys [on-change on-switch disabled? start-of-week class style attr]
-          :or   {start-of-week (state/get-start-of-week)} ;; Default to Sunday
-          :as   args}]
+  (shortcut/mixin :shortcut.handler/date-picker false)
+  [_model {:keys [on-change disabled? start-of-week class style attr]
+           :or   {start-of-week (state/get-start-of-week)} ;; Default to Sunday
+           :as   args}]
   (let [internal-model (util/react *internal-model)
         display-month (first-day-of-the-month (or internal-model (now->utc)))
         props-with-defaults (merge args {:start-of-week start-of-week})

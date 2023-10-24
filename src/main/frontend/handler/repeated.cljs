@@ -1,8 +1,8 @@
 (ns frontend.handler.repeated
+  "Provides fns related to schedule and deadline"
   (:require [cljs-time.core :as t]
             [cljs-time.local :as tl]
             [cljs-time.format :as tf]
-            [frontend.date :as date]
             [clojure.string :as string]
             [frontend.util :as util]))
 
@@ -39,7 +39,7 @@
 (defn timestamp->text
   ([timestamp]
    (timestamp->text timestamp nil))
-  ([{:keys [date wday repetition time active]} start-time]
+  ([{:keys [date repetition time]} start-time]
    (let [{:keys [year month day]} date
          {:keys [hour min]
           :or {hour 0 min 0}} time
@@ -49,7 +49,7 @@
                       [hour min])
          [[kind] [duration] num] repetition
          start-time (or start-time (t/local-date-time year month day hour min))
-         [duration-f d] (get-duration-f-and-text duration)
+         [_duration-f d] (get-duration-f-and-text duration)
          kind (get-repeater-symbol kind)
          repeater (when (and kind num d)
                     (str kind num d))
@@ -59,7 +59,7 @@
                                 ""
                                 (str " " repeater)))
                          repeater)]
-     (util/format "<%s%s>"
+     (util/format "%s%s"
                   (tf/unparse custom-formatter start-time)
                   (if (string/blank? time-repeater)
                     ""
@@ -82,7 +82,7 @@
       result)))
 
 (defn next-timestamp-text
-  [{:keys [date wday repetition time active] :as timestamp}]
+  [{:keys [date repetition time] :as timestamp}]
   (let [{:keys [year month day]} date
         {:keys [hour min]
          :or {hour 0 min 0}} time
@@ -91,17 +91,17 @@
                   (= duration "w"))
         [duration-f _] (get-duration-f-and-text duration)
         delta (duration-f num)
-        today (date/get-local-date)
         start-time (t/local-date-time year month day hour min)
         now (tl/local-now)
         start-time' (case kind
                       "Dotted"
-                      (if (t/after? start-time now)
-                        start-time
-                        (t/plus now delta))
+                      (repeat-until-future-timestamp start-time now delta week?)
 
                       "DoublePlus"
-                      (repeat-until-future-timestamp start-time now delta week?)
+                      (if (t/after? start-time now)
+                        start-time
+                        (t/plus start-time delta))
+
 
                       ;; "Plus"
                       (t/plus start-time delta))]
@@ -125,7 +125,7 @@
                    (str " " time-repeater)))))
 
 (defn timestamp->map
-  [{:keys [date wday repetition time active]}]
+  [{:keys [date repetition time]}]
   (let [{:keys [year month day]} date
         {:keys [hour min]} time
         [[kind] [duration] num] repetition]

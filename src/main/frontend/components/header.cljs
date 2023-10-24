@@ -1,216 +1,282 @@
 (ns frontend.components.header
-  (:require [rum.core :as rum]
-            [reitit.frontend.easy :as rfe]
-            [clojure.string :as string]
-            [frontend.db :as db]
+  (:require [cljs-bean.core :as bean]
+            [frontend.components.export :as export]
+            [frontend.components.page-menu :as page-menu]
+            [frontend.components.plugins :as plugins]
+            [frontend.components.server :as server]
+            [frontend.components.right-sidebar :as sidebar]
+            [frontend.components.svg :as svg]
+            [frontend.config :as config]
+            [frontend.context.i18n :refer [t]]
+            [frontend.handler :as handler]
+            [frontend.handler.file-sync :as file-sync-handler]
+            [frontend.components.file-sync :as fs-sync]
+            [frontend.handler.plugin :as plugin-handler]
+            [frontend.handler.route :as route-handler]
+            [frontend.handler.user :as user-handler]
+            [frontend.handler.web.nfs :as nfs]
+            [frontend.mobile.util :as mobile-util]
+            [frontend.state :as state]
             [frontend.ui :as ui]
             [frontend.util :as util]
-            [frontend.state :as state]
-            [frontend.storage :as storage]
-            [frontend.config :as config]
-            [frontend.context.i18n :as i18n]
-            [frontend.handler.ui :as ui-handler]
-            [frontend.handler.user :as user-handler]
-            [frontend.handler.export :as export]
-            [frontend.components.svg :as svg]
-            [frontend.components.repo :as repo]
-            [frontend.components.search :as search]
-            [frontend.handler.project :as project-handler]
-            [frontend.handler.page :as page-handler]
-            [frontend.handler.web.nfs :as nfs]
-            [goog.dom :as gdom]
-            [goog.object :as gobj]))
+            [frontend.version :refer [version]]
+            [reitit.frontend.easy :as rfe]
+            [rum.core :as rum]
+            [clojure.string :as string]))
 
-(rum/defc logo < rum/reactive
-  [{:keys [white?]}]
-  [:a.cp__header-logo
-   {:href     (rfe/href :home)
-    :on-click (fn []
-                (util/scroll-to-top)
-                (state/set-journals-length! 1))}
-   (if-let [logo (and config/publishing?
-                      (get-in (state/get-config) [:project :logo]))]
-     [:img.cp__header-logo-img {:src logo}]
-     (svg/logo (not white?)))])
+(rum/defc home-button
+  < {:key-fn #(identity "home-button")}
+  []
+  (ui/with-shortcut :go/home "left"
+    [:button.button.icon.inline
+     {:title (t :home)
+      :on-click #(do
+                   (when (mobile-util/native-iphone?)
+                     (state/set-left-sidebar-open! false))
+                   (route-handler/redirect-to-home!))}
+     (ui/icon "home" {:size ui/icon-size})]))
 
-(rum/defc login
-  [logged?]
-  (rum/with-context [[t] i18n/*tongue-context*]
-    (when (and (not logged?)
-               (not config/publishing?))
-
-      (ui/dropdown-with-links
-       (fn [{:keys [toggle-fn]}]
-         [:a.fade-link {:on-click toggle-fn}
-          [:span.ml-1 (t :login)]])
-       (let [list [{:title (t :login-google)
-                    :url (str config/website "/login/google")}
-                   {:title (t :login-github)
-                    :url (str config/website "/login/github")}]]
-         (mapv
-          (fn [{:keys [title url]}]
-            {:title title
-             :options
-             {:on-click
-              (fn [_] (set! (.-href js/window.location) url))}})
-          list))
-       nil))))
+(rum/defc login < rum/reactive
+  < {:key-fn #(identity "login-button")}
+  []
+  (let [_ (state/sub :auth/id-token)
+        loading? (state/sub [:ui/loading? :login])
+        sync-enabled? (file-sync-handler/enable-sync?)
+        logged? (user-handler/logged-in?)]
+    (when-not (or config/publishing?
+                  logged?
+                  (not sync-enabled?))
+      [:span.flex.space-x-2
+       [:a.button.text-sm.font-medium.block
+        {:on-click #(state/pub-event! [:user/login])}
+        [:span (t :login)]
+        (when loading?
+          [:span.ml-2 (ui/loading "")])]])))
 
 (rum/defc left-menu-button < rum/reactive
+  < {:key-fn #(identity "left-menu-toggle-button")}
   [{:keys [on-click]}]
-  [:button#left-menu.cp__header-left-menu
-   {:on-click on-click}
-   [:svg.h-6.w-6
-    {:viewBox "0 0 24 24", :fill "none", :stroke "currentColor"}
-    [:path
-     {:d "M4 6h16M4 12h16M4 18h7"
-      :stroke-width "2"
-      :stroke-linejoin "round"
-      :stroke-linecap "round"}]]])
+  (ui/with-shortcut :ui/toggle-left-sidebar "bottom"
+    [:button.#left-menu.cp__header-left-menu.button.icon
+     {:title (t :header/toggle-left-sidebar)
+      :on-click on-click}
+     (ui/icon "menu-2" {:size ui/icon-size})]))
+
+(defn bug-report-url []
+  (let [ua (.-userAgent js/navigator)
+        safe-ua (string/replace ua #"[^_/a-zA-Z0-9\.\(\)]+" " ")
+        platform (str "App Version: " version "\n"
+                      "Git Revision: " config/REVISION "\n"
+                      "Platform: " safe-ua "\n"
+                      "Language: " (.-language js/navigator) "\n"
+                      "Plugins: " (string/join ", " (map (fn [[k v]]
+                                                           (str (name k) " (" (:version v) ")"))
+                                                         (:plugin/installed-plugins @state/state))))]
+    (str "https://github.com/logseq/logseq/issues/new?"
+         "title=&"
+         "template=bug_report.yaml&"
+         "labels=from:in-app&"
+         "platform="
+         (js/encodeURIComponent platform))))
 
 (rum/defc dropdown-menu < rum/reactive
-  [{:keys [me current-repo t default-home]}]
-  (let [projects (state/sub [:me :projects])
-        logged? (state/logged?)]
+  < {:key-fn #(identity "repos-dropdown-menu")}
+  [{:keys [current-repo t]}]
+  (let [page-menu (page-menu/page-menu nil)
+        page-menu-and-hr (when (seq page-menu)
+                           (concat page-menu [{:hr true}]))]
     (ui/dropdown-with-links
      (fn [{:keys [toggle-fn]}]
-       [:a.cp__right-menu-button
-        {:on-click toggle-fn}
-        (svg/horizontal-dots nil)])
+       [:button.button.icon.toolbar-dots-btn
+        {:on-click toggle-fn
+         :title (t :header/more)}
+        (ui/icon "dots" {:size ui/icon-size})])
      (->>
-      [(when-not (util/mobile?)
-         {:title (t :help/toggle-right-sidebar)
-          :options {:on-click state/toggle-sidebar-open?!}})
-
-       (when current-repo
-         {:title (t :graph-view)
-          :options {:href (rfe/href :graph)}
-          :icon svg/graph-sm})
-
-       (when (or logged? (and (nfs/supported?) current-repo))
-         {:title (t :all-graphs)
-          :options {:href (rfe/href :repos)}
-          :icon svg/repos-sm})
-
-       (when current-repo
-         {:title (t :all-pages)
-          :options {:href (rfe/href :all-pages)}
-          :icon svg/pages-sm})
-
-       (when current-repo
-         {:title (t :all-files)
-          :options {:href (rfe/href :all-files)}
-          :icon svg/folder-sm})
-
-       (when (and default-home current-repo)
-         {:title (t :all-journals)
-          :options {:href (rfe/href :all-journals)}
-          :icon svg/calendar-sm})
-
-       (when (project-handler/get-current-project current-repo projects)
-         {:title (t :my-publishing)
-          :options {:href (rfe/href :my-publishing)}})
-
-       (when-let [project (and current-repo
-                               (project-handler/get-current-project current-repo projects))]
-         (let [link (str config/website "/" project)]
-           {:title (str (t :go-to) "/" project)
-            :options {:href link
-                      :target "_blank"}
-            :icon svg/external-link}))
-
-       (when current-repo
+      [(when (state/enable-editing?)
          {:title (t :settings)
-          :options {:on-click #(ui-handler/toggle-settings-modal!)}
-          :icon svg/settings-sm})
+          :options {:on-click state/open-settings!}
+          :icon (ui/icon "settings")})
+
+       (when config/lsp-enabled?
+         {:title (t :plugins)
+          :options {:on-click #(plugin-handler/goto-plugins-dashboard!)}
+          :icon (ui/icon "apps")})
+
+       (when config/lsp-enabled?
+         {:title (t :themes)
+          :options {:on-click #(plugins/open-select-theme!)}
+          :icon (ui/icon "palette")})
 
        (when current-repo
-         {:title (t :export)
-          :options {:on-click (fn []
-                                (export/export-repo-as-html! current-repo))}
-          :icon nil})
-       (when current-repo
+         {:title (t :export-graph)
+          :options {:on-click #(state/set-modal! export/export)}
+          :icon (ui/icon "database-export")})
+
+       (when (and current-repo (state/enable-editing?))
          {:title (t :import)
           :options {:href (rfe/href :import)}
-          :icon svg/import-sm})
-       {:title [:div.flex-row.flex.justify-between.items-center
-                [:span (t :join-community)]]
-        :options {:href "https://discord.gg/KpN4eHY"
-                  :title (t :discord-title)
-                  :target "_blank"}
-        :icon svg/discord}
-       (when logged?
-         {:title (t :sign-out)
-          :options {:on-click user-handler/sign-out!}
-          :icon svg/logout-sm})]
+          :icon (ui/icon "file-upload")})
+
+       (when-not config/publishing?
+         {:title [:div.flex-row.flex.justify-between.items-center
+                  [:span (t :join-community)]]
+          :options {:href "https://discuss.logseq.com"
+                    :title (t :discourse-title)
+                    :target "_blank"}
+          :icon (ui/icon "brand-discord")})
+
+       (when-not config/publishing?
+         {:title [:div.flex-row.flex.justify-between.items-center
+                  [:span (t :help/bug)]]
+          :options {:href (rfe/href :bug-report)}
+          :icon (ui/icon "bug")})
+
+       (when config/publishing?
+         {:title (t :toggle-theme)
+          :options {:on-click #(state/toggle-theme!)}
+          :icon (ui/icon "bulb")})
+
+       (when (and (state/sub :auth/id-token) (user-handler/logged-in?))
+         {:title (t :logout-user (user-handler/email))
+          :options {:on-click #(user-handler/logout)}
+          :icon  (ui/icon "logout")})]
+      (concat page-menu-and-hr)
       (remove nil?))
-     ;; {:links-footer (when (and (util/electron?) (not logged?))
-     ;;                  [:div.px-2.py-2 (login logged?)])}
-)))
+     {})))
 
-(rum/defc header
-  < rum/reactive
-  [{:keys [open-fn current-repo white? logged? page? route-match me default-home new-block-mode]}]
-  (let [local-repo? (= current-repo config/local-repo)
-        repos (->> (state/sub [:me :repos])
-                   (remove #(= (:url %) config/local-repo)))]
-    (rum/with-context [[t] i18n/*tongue-context*]
-      [:div.cp__header#head
-       {:on-double-click (fn [^js e]
-                           (when-let [target (.-target e)]
-                             (when (and (util/electron?)
-                                        (or (.. target -classList (contains "cp__header"))
-                                            (. target (closest "#search"))))
-                               (js/window.apis.toggleMaxOrMinActiveWindow))))}
-       (left-menu-button {:on-click (fn []
-                                      (open-fn)
-                                      (state/set-left-sidebar-open! true))})
+(rum/defc back-and-forward
+  < {:key-fn #(identity "nav-history-buttons")}
+  []
+  [:div.flex.flex-row
 
-       (logo {:white? white?})
+   (ui/with-shortcut :go/backward "bottom"
+     [:button.it.navigation.nav-left.button.icon
+      {:title (t :header/go-back) :on-click #(js/window.history.back)}
+      (ui/icon "arrow-left" {:size ui/icon-size})])
 
-       (when (util/electron?)
-         [:a.mr-1.opacity-30.hover:opacity-100.it.navigation
-          {:style {:margin-left -10}
-           :title "Go Back" :on-click #(js/window.history.back)} (svg/arrow-left)])
+   (ui/with-shortcut :go/forward "bottom"
+     [:button.it.navigation.nav-right.button.icon
+      {:title (t :header/go-forward) :on-click #(js/window.history.forward)}
+      (ui/icon "arrow-right" {:size ui/icon-size})])])
 
-       (when (util/electron?)
-         [:a.opacity-30.hover:opacity-100.it.navigation
-          {:style {:margin-right 15}
-           :title "Go Forward" :on-click #(js/window.history.forward)} (svg/arrow-right)])
+(rum/defc updater-tips-new-version
+  [t]
+  (let [[downloaded, set-downloaded] (rum/use-state nil)
+        _ (rum/use-effect!
+           (fn []
+             (when-let [channel (and (util/electron?) "auto-updater-downloaded")]
+               (let [callback (fn [_ args]
+                                (js/console.debug "[new-version downloaded] args:" args)
+                                (let [args (bean/->clj args)]
+                                  (set-downloaded args)
+                                  (state/set-state! :electron/auto-updater-downloaded args))
+                                nil)]
+                 (js/apis.addListener channel callback)
+                 #(js/apis.removeListener channel callback))))
+           [])]
 
-       (if current-repo
-         (search/search)
-         [:div.flex-1])
+    (when downloaded
+      [:div.cp__header-tips
+       [:p (t :updater/new-version-install)
+        [:a.restart.ml-2
+         {:on-click #(handler/quit-and-install-new-version!)}
+         (svg/reload 16) [:strong (t :updater/quit-and-install)]]]])))
 
-       (new-block-mode)
+(rum/defc ^:large-vars/cleanup-todo header < rum/reactive
+  [{:keys [open-fn current-repo default-home new-block-mode]}]
+  (let [repos (->> (state/sub [:me :repos])
+                   (remove #(= (:url %) config/local-repo)))
+        _ (state/sub [:user/info :UserGroups])
+        electron-mac? (and util/mac? (util/electron?))
+        show-open-folder? (and (nfs/supported?)
+                               (or (empty? repos)
+                                   (nil? (state/sub :git/current-repo)))
+                               (not (mobile-util/native-platform?))
+                               (not config/publishing?))
+        left-menu (left-menu-button {:on-click (fn []
+                                                 (open-fn)
+                                                 (state/set-left-sidebar-open!
+                                                  (not (:ui/left-sidebar-open? @state/state))))})
+        custom-home-page? (and (state/custom-home-page?)
+                               (= (state/sub-default-home-page) (state/get-current-page)))
+        sync-enabled? (file-sync-handler/enable-sync?)]
+    [:div.cp__header.drag-region#head
+     {:class           (util/classnames [{:electron-mac   electron-mac?
+                                          :native-ios     (mobile-util/native-ios?)
+                                          :native-android (mobile-util/native-android?)}])
+      :on-double-click (fn [^js e]
+                         (when-let [target (.-target e)]
+                           (cond
+                             (and (util/electron?)
+                                  (.. target -classList (contains "drag-region")))
+                             (js/window.apis.toggleMaxOrMinActiveWindow)
 
-       (when-not (util/electron?)
-         (login logged?))
+                             (mobile-util/native-platform?)
+                             (util/scroll-to-top true))))
+      :style           {:fontSize 50}}
+     [:div.l.flex.drag-region
+      [left-menu
+       (if (mobile-util/native-platform?)
+         ;; back button for mobile
+         (when-not (or (state/home?) custom-home-page? (state/whiteboard-dashboard?))
+           (ui/with-shortcut :go/backward "bottom"
+             [:button.it.navigation.nav-left.button.icon.opacity-70
+              {:title (t :header/go-back) :on-click #(js/window.history.back)}
+              (ui/icon "chevron-left" {:size 26})]))
+         ;; search button for non-mobile
+         (when current-repo
+           (ui/with-shortcut :go/search "right"
+             [:button.button.icon#search-button
+              {:title (t :header/search)
+               :on-click #(do (when (or (mobile-util/native-android?)
+                                        (mobile-util/native-iphone?))
+                                (state/set-left-sidebar-open! false))
+                              (state/pub-event! [:go/search]))}
+              (ui/icon "search" {:size ui/icon-size})])))]]
 
-       (repo/sync-status current-repo)
+     [:div.r.flex.drag-region
+      (when (and current-repo
+                 (not (config/demo-graph? current-repo))
+                 (user-handler/alpha-or-beta-user?))
+        (fs-sync/indicator))
 
-       [:div.repos.hidden.md:block
-        (repo/repos-dropdown true nil)]
+      (when (and (not= (state/get-current-route) :home)
+                 (not custom-home-page?))
+        (home-button))
 
-       (when (and (nfs/supported?) (empty? repos)
-                  (not config/publishing?))
-         [:a.text-sm.font-medium.opacity-70.hover:opacity-100.ml-3.block
-          {:on-click (fn []
-                       (page-handler/ls-dir-files!))}
-          [:div.flex.flex-row.text-center
-           [:span.inline-block svg/folder-add]
-           (when-not config/mobile?
-             [:span.ml-1 {:style {:margin-top 2}}
-              (t :open)])]])
+      (when sync-enabled?
+        (login))
 
-       (if config/publishing?
-         [:a.text-sm.font-medium.ml-3 {:href (rfe/href :graph)}
-          (t :graph)])
+      (when config/lsp-enabled?
+        [:<>
+         (plugins/hook-ui-items :toolbar)
+         (plugins/updates-notifications)])
 
-       (dropdown-menu {:me me
-                       :t t
-                       :current-repo current-repo
-                       :default-home default-home})
+      (when (state/feature-http-server-enabled?)
+        (server/server-indicator (state/sub :electron/server)))
 
-       [:a#download-as-html.hidden]
-       [:a#download-as-zip.hidden]])))
+      (when (util/electron?)
+        (back-and-forward))
+
+      (when-not (mobile-util/native-platform?)
+        (new-block-mode))
+
+      (when show-open-folder?
+        [:a.text-sm.font-medium.button.icon.add-graph-btn.flex.items-center
+         {:on-click #(route-handler/redirect! {:to :repo-add})}
+         (ui/icon "folder-plus")
+         (when-not config/mobile?
+           [:span.ml-1 {:style {:margin-top (if electron-mac? 0 2)}}
+            (t :on-boarding/add-graph)])])
+
+      (when config/publishing?
+        [:a.text-sm.font-medium.button {:href (rfe/href :graph)}
+         (t :graph)])
+
+      (dropdown-menu {:t            t
+                      :current-repo current-repo
+                      :default-home default-home})
+
+      (sidebar/toggle)
+
+      (updater-tips-new-version t)]]))

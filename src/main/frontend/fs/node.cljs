@@ -1,90 +1,140 @@
 (ns frontend.fs.node
-  (:require [frontend.fs.protocol :as protocol]
-            [frontend.util :as util]
-            [frontend.db :as db]
+  "Implementation of fs protocol for Electron, based on nodejs"
+  (:require [cljs-bean.core :as bean]
             [clojure.string :as string]
-            [promesa.core :as p]
             [electron.ipc :as ipc]
-            [cljs-bean.core :as bean]
+            [frontend.config :as config]
+            [frontend.db :as db]
+            [frontend.fs.protocol :as protocol]
+            [frontend.state :as state]
+            [frontend.util :as util]
             [goog.object :as gobj]
-            [lambdaisland.glogi :as log]))
+            [lambdaisland.glogi :as log]
+            [promesa.core :as p]
+            [logseq.common.path :as path]))
 
-(defn concat-path
-  [dir path]
-  (cond
-    (nil? path)
-    dir
-
-    (string/starts-with? path dir)
-    path
-
-    :else
-    (str (string/replace dir #"/$" "")
-         (when path
-           (str "/" (string/replace path #"^/" ""))))))
+(defn- contents-matched?
+  [disk-content db-content]
+  (when (and (string? disk-content) (string? db-content))
+    (p/resolved (= (string/trim disk-content) (string/trim db-content)))))
 
 (defn- write-file-impl!
-  [repo dir path content {:keys [ok-handler error-handler] :as opts} stat]
-  (->
-   (p/let [result (ipc/ipc "writeFile" path content)
-           mtime (gobj/get result "mtime")]
-     (db/set-file-last-modified-at! repo path mtime)
-     (when ok-handler
-       (ok-handler repo path result))
-     result)
-   (p/catch (fn [error]
-              (if error-handler
-                (error-handler error)
-                (log/error :write-file-failed error)))))
-  ;; (p/let [disk-mtime (when stat (gobj/get stat "mtime"))
-  ;;         db-mtime (db/get-file-last-modified-at repo path)]
-  ;;   (if (not= disk-mtime db-mtime)
-  ;;     (js/alert (str "The file has been modified in your local disk! File path: " path
-  ;;                    ", please save your changes and click the refresh button to reload it."))
-  ;;     (->
-  ;;      (p/let [result (ipc/ipc "writeFile" path content)
-  ;;              mtime (gobj/get result "mtime")]
-  ;;        (db/set-file-last-modified-at! repo path mtime)
-  ;;        (when ok-handler
-  ;;          (ok-handler repo path result))
-  ;;        result)
-  ;;      (p/catch (fn [error]
-  ;;                 (if error-handler
-  ;;                   (error-handler error)
-  ;;                   (log/error :write-file-failed error)))))))
-)
+  [repo dir rpath content {:keys [ok-handler error-handler old-content skip-compare?]} stat]
+  (let [file-fpath (path/path-join dir rpath)]
+    (if skip-compare?
+      (p/catch
+       (p/let [result (ipc/ipc "writeFile" repo file-fpath content)]
+         (when ok-handler
+           (ok-handler repo rpath result)))
+       (fn [error]
+         (if error-handler
+           (error-handler error)
+           (log/error :write-file-failed error))))
+
+      (p/let [disk-content (when (not= stat :not-found)
+                             (-> (ipc/ipc "readFile" file-fpath)
+                                 (p/then bean/->clj)
+                                 (p/catch (fn [error]
+                                            (js/console.error error)
+                                            nil))))
+              disk-content (or disk-content "")
+              ext (string/lower-case (util/get-file-ext rpath))
+              db-content (or old-content (db/get-file repo rpath) "")
+              contents-matched? (contents-matched? disk-content db-content)]
+        (cond
+          (and
+           (not= stat :not-found)         ; file on the disk was deleted
+           (not contents-matched?)
+           (not (contains? #{"excalidraw" "edn" "css"} ext))
+           (not (string/includes? rpath "/.recycle/")))
+          (state/pub-event! [:file/not-matched-from-disk rpath disk-content content])
+
+          :else
+          (->
+           (p/let [result (ipc/ipc "writeFile" repo file-fpath content)
+                   mtime (gobj/get result "mtime")]
+             (when-not contents-matched?
+               (ipc/ipc "backupDbFile" (config/get-local-dir repo) rpath disk-content content))
+             (db/set-file-last-modified-at! repo rpath mtime)
+             (db/set-file-content! repo rpath content)
+             (when ok-handler
+               (ok-handler repo rpath result))
+             result)
+           (p/catch (fn [error]
+                      (if error-handler
+                        (error-handler error)
+                        (log/error :write-file-failed error))))))))))
+
+(defn- open-dir
+  "Open a new directory"
+  [dir]
+  (p/let [dir-path (or dir (util/mocked-open-dir-path))
+          result (if dir-path
+                   (do
+                     (println "NOTE: Using mocked dir" dir-path)
+                     (ipc/ipc "getFiles" dir-path))
+                   (ipc/ipc "openDir" {}))
+          result (bean/->clj result)]
+    result))
 
 (defrecord Node []
   protocol/Fs
-  (mkdir! [this dir]
-    (ipc/ipc "mkdir" dir))
-  (readdir [this dir]                   ; recursive
-    (ipc/ipc "readdir" dir))
-  (unlink! [this path _opts]
-    (ipc/ipc "unlink" path))
-  (rmdir! [this dir]
+  (mkdir! [_this dir]
+    (-> (ipc/ipc "mkdir" dir)
+        (p/then (fn [_] (js/console.log (str "Directory created: " dir))))
+        (p/catch (fn [error]
+                   (when (not= (.-code error) "EEXIST")
+                     (js/console.error (str "Error creating directory: " dir) error))))))
+
+  (mkdir-recur! [_this dir]
+    (ipc/ipc "mkdir-recur" dir))
+
+  (readdir [_this dir]                   ; recursive
+    (p/then (ipc/ipc "readdir" dir)
+            bean/->clj))
+
+  (unlink! [_this repo path _opts]
+    (ipc/ipc "unlink"
+             (config/get-repo-dir repo)
+             path))
+  (rmdir! [_this _dir]
+    ;; !Too dangerous! We'll never implement this.
     nil)
-  (read-file [this dir path _options]
-    (let [path (concat-path dir path)]
+
+  (read-file [_this dir path _options]
+    (let [path (if (nil? dir)
+                 path
+                 (path/path-join dir path))]
       (ipc/ipc "readFile" path)))
-  (write-file! [this repo dir path content {:keys [ok-handler error-handler] :as opts}]
-    (let [path (concat-path dir path)]
-      (->
-       (p/let [stat (protocol/stat this dir path)]
-         ;; update
-         (write-file-impl! repo dir path content opts stat))
-       (p/catch
-        (fn [_error]
-             ;; create
-          (write-file-impl! repo dir path content opts nil))))))
-  (rename! [this repo old-path new-path]
+
+  (write-file! [this repo dir path content opts]
+    (p/let [fpath (path/path-join dir path)
+            stat (p/catch
+                  (protocol/stat this fpath)
+                  (fn [_e] :not-found))
+            parent-dir (path/parent fpath)
+            _ (protocol/mkdir-recur! this parent-dir)]
+      (write-file-impl! repo dir path content opts stat)))
+
+  (rename! [_this _repo old-path new-path]
     (ipc/ipc "rename" old-path new-path))
-  (stat [this dir path]
-    (let [path (concat-path dir path)]
-      (ipc/ipc "stat" path)))
-  (open-dir [this ok-handler]
-    (ipc/ipc "openDir" {}))
-  (get-files [this path-or-handle ok-handler]
-    (ipc/ipc "getFiles" path-or-handle))
-  (watch-dir! [this dir]
-    (ipc/ipc "addDirWatcher" dir)))
+  ;; copy with overwrite, without confirmation
+  (copy! [_this repo old-path new-path]
+    (ipc/ipc "copyFile" repo old-path new-path))
+  (stat [_this fpath]
+    (-> (ipc/ipc "stat" fpath)
+        (p/then bean/->clj)))
+
+  (open-dir [_this dir]
+    (open-dir dir))
+
+  (get-files [_this dir]
+    (-> (ipc/ipc "getFiles" dir)
+        (p/then (fn [result]
+                  (:files (bean/->clj result))))))
+
+  (watch-dir! [_this dir options]
+    (ipc/ipc "addDirWatcher" dir options))
+
+  (unwatch-dir! [_this dir]
+    (ipc/ipc "unwatchDir" dir)))

@@ -1,80 +1,26 @@
 (ns frontend.search
-  (:require [frontend.db :as db]
-            [frontend.search.db :as search-db :refer [indices]]
-            [frontend.config :as config]
-            [frontend.state :as state]
-            [frontend.util :as util :refer-macros [profile]]
-            [cljs-bean.core :as bean]
+  "Provides search functionality for a number of features including Cmd-K
+  search. Most of these fns depend on the search protocol"
+  (:require [cljs-bean.core :as bean]
             [clojure.string :as string]
-            [clojure.set :as set]
+            [logseq.graph-parser.config :as gp-config]
+            [frontend.db :as db]
+            [frontend.db.model :as db-model]
             [frontend.regex :as regex]
-            [frontend.text :as text]
-            [cljs-bean.core :as bean]
+            [frontend.search.agency :as search-agency]
+            [frontend.search.db :as search-db :refer [indices]]
+            [frontend.search.protocol :as protocol]
+            [frontend.state :as state]
+            [frontend.util :as util]
+            [frontend.util.property :as property]
             [goog.object :as gobj]
-            ["fuse.js" :as fuse]
-            [medley.core :as medley]
             [promesa.core :as p]
-            ["/frontend/utils" :as utils]))
+            [clojure.set :as set]
+            [frontend.modules.datascript-report.core :as db-report]))
 
-(defn go
-  [q indice opts]
-  (.search indice q opts))
-
-(defn block->index
-  [{:block/keys [uuid content format] :as block}]
-  (when-let [result (->> (text/remove-level-spaces content format)
-                         (text/remove-properties!))]
-    {:id (:db/id block)
-     :uuid (str uuid)
-     :content result}))
-
-(defn make-blocks-indice!
-  []
-  (when-let [repo (state/get-current-repo)]
-    (let [blocks (->> (db/get-all-block-contents)
-                      (map block->index)
-                      (remove nil?)
-                      (bean/->js))
-          indice (fuse. blocks
-                        (clj->js {:keys ["uuid" "content"]
-                                  :shouldSort true
-                                  :minMatchCharLength 2
-                                  :threshold 0.4}))]
-      (swap! indices assoc-in [repo :blocks] indice)
-      indice)))
-
-(defn make-pages-indice!
-  []
-  (when-let [repo (state/get-current-repo)]
-    (let [pages (->> (db/get-pages (state/get-current-repo))
-                     (remove string/blank?)
-                     (map (fn [p] {:name p}))
-                     (bean/->js))
-          indice (fuse. pages
-                        (clj->js {:keys ["name"]
-                                  :shouldSort true
-                                  :minMatchCharLength 2
-                                  :threshold 0.2
-                                  }))]
-      (swap! indices assoc-in [repo :pages] indice)
-      indice)))
-
-;; TODO: persist indices to indexeddb, it'll be better if the future db
-;; can has the direct fuzzy search support.
-(defn rebuild-indices!
-  ([]
-   (rebuild-indices! (state/get-current-repo)))
-  ([repo]
-   (when repo
-     (let [result {:pages (make-pages-indice!)
-                   :blocks (make-blocks-indice!)}]
-       (swap! indices assoc repo result)
-       result))))
-
-(defn reset-indice!
+(defn get-engine
   [repo]
-  (swap! indices assoc repo {:pages nil
-                             :blocks nil}))
+  (search-agency/->Agency repo))
 
 ;; Copied from https://gist.github.com/vaughnd/5099299
 (defn str-len-distance
@@ -118,7 +64,7 @@
                       (str-len-distance query str)
                       (if (<= 0 (.indexOf ostr oquery)) MAX-STRING-LENGTH 0))
         (empty? s) 0
-        :default (if (= (first q) (first s))
+        :else (if (= (first q) (first s))
                    (recur (rest q)
                           (rest s)
                           (inc mult) ;; increase the multiplier as more query chars are matched
@@ -133,58 +79,82 @@
 (defn fuzzy-search
   [data query & {:keys [limit extract-fn]
                  :or {limit 20}}]
-  (let [query (string/lower-case query)]
+  (let [query (util/search-normalize query (state/enable-search-remove-accents?))]
     (->> (take limit
                (sort-by :score (comp - compare)
                         (filter #(< 0 (:score %))
                                 (for [item data]
-                                  (let [s (if extract-fn (extract-fn item) item)]
+                                  (let [s (str (if extract-fn (extract-fn item) item))]
                                     {:data item
-                                     :score (score query (.toLowerCase s))})))))
+                                     :score (score query (util/search-normalize s (state/enable-search-remove-accents?)))})))))
          (map :data))))
 
 (defn block-search
-  ([q]
-   (block-search q 10))
-  ([q limit]
-   (when-let [repo (state/get-current-repo)]
-     (when-not (string/blank? q)
-       (let [q (string/lower-case q)
-             q (escape-str q)]
-         (when-not (string/blank? q)
-           (let [indice (or (get-in @indices [repo :blocks])
-                            (make-blocks-indice!))]
-             (let [result (go q indice (clj->js {:limit limit}))
-                   result (bean/->clj result)]
-               (->>
-                (map
-                  (fn [{:keys [item matches] :as block}]
-                    (let [{:keys [content uuid]} item]
-                      {:block/uuid uuid
-                       :block/content content
-                       :block/page (:block/page (db/entity [:block/uuid (medley/uuid (str uuid))]))
-                       :search/matches matches}))
-                 result)
-                (remove nil?))))))))))
+  [repo q option]
+  (when-let [engine (get-engine repo)]
+    (let [q (util/search-normalize q (state/enable-search-remove-accents?))
+          q (if (util/electron?) q (escape-str q))]
+      (when-not (string/blank? q)
+        (protocol/query engine q option)))))
+
+(defn page-content-search
+  [repo q option]
+  (when-let [engine (get-engine repo)]
+    (let [q (util/search-normalize q (state/enable-search-remove-accents?))
+          q (if (util/electron?) q (escape-str q))]
+      (when-not (string/blank? q)
+        (protocol/query-page engine q option)))))
+
+(defn- transact-blocks!
+  [repo data]
+  (when-let [engine (get-engine repo)]
+    (protocol/transact-blocks! engine data)))
+
+(defn- transact-pages!
+  "Transact pages to search engine
+   :pages-to-remove-set the set of pages to remove (not include those to update)
+   :pages-to-add        the page entities to add"
+  [repo data]
+  (when-let [engine (get-engine repo)]
+    (protocol/transact-pages! engine data)))
+
+(defn exact-matched?
+  "Check if two strings points toward same search result"
+  [q match]
+  (when (and (string? q) (string? match))
+    (boolean
+     (reduce
+      (fn [coll char]
+        (let [coll' (drop-while #(not= char %) coll)]
+          (if (seq coll')
+            (rest coll')
+            (reduced false))))
+      (seq (util/search-normalize match (state/enable-search-remove-accents?)))
+      (seq (util/search-normalize q (state/enable-search-remove-accents?)))))))
 
 (defn page-search
+  "Return a list of page names that match the query"
   ([q]
-   (page-search q 3))
+   (page-search q 10))
   ([q limit]
    (when-let [repo (state/get-current-repo)]
-     (let [q (string/lower-case q)
+     (let [q (util/search-normalize q (state/enable-search-remove-accents?))
            q (clean-str q)]
        (when-not (string/blank? q)
          (let [indice (or (get-in @indices [repo :pages])
-                          (make-pages-indice!))
-               result (->> (go q indice (clj->js {:limit limit}))
+                          (search-db/make-pages-title-indice!))
+               result (->> (.search indice q (clj->js {:limit limit}))
                            (bean/->clj))]
            ;; TODO: add indexes for highlights
            (->> (map
                   (fn [{:keys [item]}]
-                    (:name item))
+                    (:original-name item))
                  result)
-                (remove nil?))))))))
+                (remove nil?)
+                (map string/trim)
+                (distinct)
+                (filter (fn [original-name]
+                          (exact-matched? q original-name))))))))))
 
 (defn file-search
   ([q]
@@ -192,7 +162,7 @@
   ([q limit]
    (let [q (clean-str q)]
      (when-not (string/blank? q)
-       (let [mldoc-exts (set (map name config/mldoc-support-formats))
+       (let [mldoc-exts (set (map name gp-config/mldoc-support-formats))
              files (->> (db/get-files (state/get-current-repo))
                         (map first)
                         (remove (fn [file]
@@ -202,63 +172,195 @@
 
 (defn template-search
   ([q]
-   (template-search q 10))
+   (template-search q 100))
   ([q limit]
-   (let [q (clean-str q)]
-     (let [templates (db/get-all-templates)]
+   (when q
+     (let [q (clean-str q)
+           templates (db/get-all-templates)]
        (when (seq templates)
          (let [result (fuzzy-search (keys templates) q :limit limit)]
            (vec (select-keys templates result))))))))
 
-(defn sync-search-indice!
-  [datoms]
-  (when (seq datoms)
-    (when-let [repo (state/get-current-repo)]
+(defn get-all-properties
+  []
+  (->> (db-model/get-all-properties)
+       (remove (property/hidden-properties))
+       ;; Complete full keyword except the ':'
+       (map #(subs (str %) 1))))
+
+(defn property-search
+  ([q]
+   (property-search q 100))
+  ([q limit]
+   (when q
+     (let [q (clean-str q)
+           properties (get-all-properties)]
+       (when (seq properties)
+         (if (string/blank? q)
+           properties
+           (let [result (fuzzy-search properties q :limit limit)]
+             (vec result))))))))
+
+(defn property-value-search
+  ([property q]
+   (property-value-search property q 100))
+  ([property q limit]
+   (when q
+     (let [q (clean-str q)
+           result (db-model/get-property-values (keyword property))]
+       (when (seq result)
+         (if (string/blank? q)
+           result
+           (let [result (fuzzy-search result q :limit limit)]
+             (vec result))))))))
+
+(defn- get-pages-from-datoms-impl
+  [pages]
+  (let [pages-result (db/pull-many '[:db/id :block/name :block/original-name] (set (map :e pages)))
+        pages-to-add-set (->> (filter :added pages)
+                              (map :e)
+                              (set))
+        pages-to-add (->> (filter (fn [page]
+                                    (contains? pages-to-add-set (:db/id page))) pages-result)
+                          (map (fn [p] (or (:block/original-name p)
+                                           (:block/name p))))
+                          (remove string/blank?)
+                          (map search-db/original-page-name->index))
+        pages-to-remove-set (->> (remove :added pages)
+                                 (map :v)
+                                 set)
+        pages-to-remove-id-set (->> (remove :added pages)
+                                    (map :e)
+                                    set)]
+    {:pages-to-add        pages-to-add
+     :pages-to-remove-set pages-to-remove-set
+     :pages-to-add-id-set pages-to-add-set
+     :pages-to-remove-id-set pages-to-remove-id-set}))
+
+(defn- get-blocks-from-datoms-impl
+  [blocks]
+  (when (seq blocks)
+    (let [blocks-result (->> (db/pull-many '[:db/id :block/uuid :block/format :block/content :block/page] (set (map :e blocks)))
+                             (map (fn [b] (assoc b :block/page (get-in b [:block/page :db/id])))))
+          blocks-to-add-set (->> (filter :added blocks)
+                                 (map :e)
+                                 (set))
+          blocks-to-add (->> (filter (fn [block]
+                                       (contains? blocks-to-add-set (:db/id block)))
+                                     blocks-result)
+                             (map search-db/block->index)
+                             (remove nil?))
+          blocks-to-remove-set (->> (remove :added blocks)
+                                    (map :e)
+                                    (set))]
+      {:blocks-to-remove-set blocks-to-remove-set
+       :blocks-to-add        blocks-to-add})))
+
+(defn- get-direct-blocks-and-pages
+  [tx-report]
+  (let [data (:tx-data tx-report)
+        datoms (filter
+                (fn [datom]
+                  ;; Capture any direct change on page display title, page ref or block content
+                  (contains? #{:block/name :block/original-name :block/content} (:a datom)))
+                data)]
+    (when (seq datoms)
       (let [datoms (group-by :a datoms)
-            pages (:page/name datoms)
-            blocks (:block/content datoms)]
-        (when (seq pages)
-          (let [pages-result (db/pull-many '[:db/id :page/name :page/original-name] (set (map :e pages)))
-                pages-to-add-set (->> (filter :added pages)
-                                      (map :e)
-                                      (set))
-                pages-to-add (->> (filter (fn [page]
-                                            (contains? pages-to-add-set (:db/id page))) pages-result)
-                                  (map (fn [p] {:name (or (:page/original-name p)
-                                                          (:page/name p))})))
-                pages-to-remove-set (->> (remove :added pages)
-                                         (map :v))]
-            (swap! search-db/indices update-in [repo :pages]
-                   (fn [indice]
-                     (when indice
-                       (doseq [page-name pages-to-remove-set]
-                         (.remove indice
-                                  (fn [page]
-                                    (= page-name (gobj/get page "name")))))
-                       (when (seq pages-to-add)
-                         (doseq [page pages-to-add]
-                           (.add indice (bean/->js page)))))
-                     indice))))
-        (when (seq blocks)
-          (let [blocks-result (db/pull-many '[:db/id :block/uuid :block/format :block/content] (set (map :e blocks)))
-                blocks-to-add-set (->> (filter :added blocks)
-                                       (map :e)
-                                       (set))
-                blocks-to-add (->> (filter (fn [block]
-                                             (contains? blocks-to-add-set (:db/id block)))
-                                           blocks-result)
-                                   (map block->index))
-                blocks-to-remove-set (->> (remove :added blocks)
-                                          (map :e)
-                                          (set))]
-            (swap! search-db/indices update-in [repo :blocks]
-                   (fn [indice]
-                     (when indice
-                       (doseq [block-id blocks-to-remove-set]
-                         (.remove indice
-                                  (fn [block]
-                                    (= block-id (gobj/get block "id")))))
-                       (when (seq blocks-to-add)
-                         (doseq [block blocks-to-add]
-                           (.add indice (bean/->js block)))))
-                     indice))))))))
+            blocks (:block/content datoms)
+            pages (concat ;; Duplicated eids are handled in `get-pages-from-datoms-impl`
+                   (:block/name datoms)
+                   (:block/original-name datoms))]
+        (merge (get-blocks-from-datoms-impl blocks)
+               (get-pages-from-datoms-impl pages))))))
+
+(defn- get-indirect-pages
+  "Return the set of pages that will have content updated"
+  [tx-report]
+  (let [data   (:tx-data tx-report)
+        datoms (filter
+                (fn [datom]
+                  (and (:added datom)
+                       (contains? #{:file/content} (:a datom))))
+                data)]
+    (when (seq datoms)
+      (->> datoms
+           (mapv (fn [datom]
+                   (let [tar-db  (:db-after tx-report)]
+                     ;; Reverse query the corresponding page id of the modified `:file/content`)
+                     (when-let [page-id (->> (:e datom)
+                                             (db-report/safe-pull tar-db '[:block/_file])
+                                             (:block/_file)
+                                             (first)
+                                             (:db/id))]
+                       ;; Fetch page entity according to what page->index requested
+                       (db-report/safe-pull tar-db '[:db/id :block/uuid
+                                                     :block/original-name
+                                                     {:block/file [:file/content]}]
+                                            page-id)))))
+           (remove nil?)))))
+
+;; TODO merge with logic in `invoke-hooks` when feature and test is sufficient
+(defn sync-search-indice!
+  [repo tx-report]
+  (let [{:keys [pages-to-add pages-to-remove-set pages-to-remove-id-set
+                blocks-to-add blocks-to-remove-set]} (get-direct-blocks-and-pages tx-report) ;; directly modified block & pages
+        updated-pages (get-indirect-pages tx-report)]
+    ;; update page title indice
+    (when (or (seq pages-to-add) (seq pages-to-remove-set))
+      (swap! search-db/indices update-in [repo :pages]
+             (fn [indice]
+               (when indice
+                 (doseq [page-name pages-to-remove-set]
+                   (.remove indice
+                            (fn [page]
+                              (= (util/safe-page-name-sanity-lc page-name)
+                                 (util/safe-page-name-sanity-lc (gobj/get page "original-name"))))))
+                 (when (seq pages-to-add)
+                   (doseq [page pages-to-add]
+                     (.add indice (bean/->js page)))))
+               indice)))
+
+    ;; update block indice
+    (when (or (seq blocks-to-add) (seq blocks-to-remove-set))
+      (transact-blocks! repo
+                        {:blocks-to-remove-set blocks-to-remove-set
+                         :blocks-to-add        blocks-to-add}))
+
+    ;; update page indice
+    (when (or (seq pages-to-remove-id-set) (seq updated-pages)) ;; when move op happens, no :block/content provided
+      (let [indice-pages   (map search-db/page->index updated-pages)
+            invalid-set    (->> (map (fn [updated indiced] ;; get id of pages without valid page index
+                                       (if indiced nil (:db/id updated)))
+                                     updated-pages indice-pages)
+                                (remove nil?)
+                                set)
+            pages-to-add   (->> indice-pages
+                                (remove nil?)
+                                set)
+            pages-to-remove-set (set/union pages-to-remove-id-set invalid-set)]
+        (transact-pages! repo {:pages-to-remove-set pages-to-remove-set
+                               :pages-to-add        pages-to-add})))))
+
+(defn rebuild-indices!
+  ([]
+   (rebuild-indices! (state/get-current-repo)))
+  ([repo]
+   (when repo
+     (when-let [engine (get-engine repo)]
+       (let [page-titles (search-db/make-pages-title-indice!)]
+         (p/let [blocks (protocol/rebuild-blocks-indice! engine)]
+           (let [result {:pages         page-titles ;; TODO: rename key to :page-titles
+                         :blocks        blocks}]
+             (swap! indices assoc repo result)
+             indices)))))))
+
+(defn reset-indice!
+  [repo]
+  (when-let [engine (get-engine repo)]
+    (protocol/truncate-blocks! engine))
+  (swap! indices assoc-in [repo :pages] nil))
+
+(defn remove-db!
+  [repo]
+  (when-let [engine (get-engine repo)]
+    (protocol/remove-db! engine)))

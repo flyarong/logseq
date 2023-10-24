@@ -1,194 +1,322 @@
-(ns frontend.handler.block
-  (:require [frontend.util :as util]
-            [clojure.walk :as walk]
-            [frontend.db :as db]
-            [frontend.state :as state]
-            [frontend.format.mldoc :as mldoc]
-            [frontend.date :as date]
-            [frontend.config :as config]
-            [datascript.core :as d]))
+(ns ^:no-doc frontend.handler.block
+  (:require
+   [clojure.set :as set]
+   [clojure.string :as string]
+   [clojure.walk :as walk]
+   [frontend.db :as db]
+   [frontend.db.model :as db-model]
+   [frontend.db.react :as react]
+   [frontend.mobile.haptics :as haptics]
+   [frontend.modules.outliner.core :as outliner-core]
+   [frontend.modules.outliner.transaction :as outliner-tx]
+   [frontend.state :as state]
+   [frontend.util :as util]
+   [goog.dom :as gdom]
+   [logseq.graph-parser.block :as gp-block]))
 
-(defn blocks->vec-tree [col]
-  (let [col (map (fn [h] (cond->
-                          h
-                           (not (:block/dummy? h))
-                           (dissoc h :block/meta))) col)
-        parent? (fn [item children]
-                  (and (seq children)
-                       (every? #(< (:block/level item) (:block/level %)) children)))
-        get-all-refs (fn [block]
-                       (let [refs (if-let [refs (seq (:block/refs-with-children block))]
-                                    refs
-                                    (concat
-                                     (:block/ref-pages block)
-                                     (:block/tags block)))]
-                         (distinct refs)))]
-    (loop [col (reverse col)
-           children (list)]
-      (if (empty? col)
-        children
-        (let [[item & others] col
-              cur-level (:block/level item)
-              bottom-level (:block/level (first children))
-              pre-block? (:block/pre-block? item)
-              item (assoc item :block/refs-with-children (->> (get-all-refs item)
-                                                              (remove nil?)))]
+;;  Fns
+
+(defn long-page?
+  [repo page-id]
+  (>= (db/get-page-blocks-count repo page-id) db-model/initial-blocks-length))
+
+;; TODO: reduced version
+(defn- walk-block
+  [block check? transform]
+  (let [result (atom nil)]
+    (walk/postwalk
+     (fn [x]
+       (if (check? x)
+         (reset! result (transform x))
+         x))
+     (:block/body block))
+    @result))
+
+(defn get-timestamp
+  [block typ]
+  (walk-block block
+              (fn [x]
+                (and (gp-block/timestamp-block? x)
+                     (= typ (first (second x)))))
+              #(second (second %))))
+
+(defn get-scheduled-ast
+  [block]
+  (get-timestamp block "Scheduled"))
+
+(defn get-deadline-ast
+  [block]
+  (get-timestamp block "Deadline"))
+
+(defn load-more!
+  [db-id start-id]
+  (let [repo (state/get-current-repo)
+        db (db/get-db repo)
+        block (db/entity repo db-id)
+        block? (not (:block/name block))
+        k (if block?
+            :frontend.db.react/block-and-children
+            :frontend.db.react/page-blocks)
+        query-k [repo k db-id]
+        option (cond-> {:limit db-model/step-loading-blocks}
+                 block?
+                 (assoc :scoped-block-id db-id))
+        more-data (->> (db-model/get-paginated-blocks-no-cache db start-id option)
+                       (map #(db/pull (:db/id %))))]
+    (react/swap-new-result! query-k
+                            (fn [result]
+                              (->> (concat result more-data)
+                                   (util/distinct-by :db/id))))))
+
+(defn indentable?
+  [{:block/keys [parent left]}]
+  (when parent
+    (not= parent left)))
+
+(defn outdentable?
+  [{:block/keys [level] :as _block}]
+  (not= level 1))
+
+(defn indent-outdent-block!
+  [block direction]
+  (outliner-tx/transact!
+    {:outliner-op :move-blocks}
+    (outliner-core/indent-outdent-blocks! [block] (= direction :right))))
+
+(defn select-block!
+  [block-uuid]
+  (let [blocks (js/document.getElementsByClassName (str block-uuid))]
+    (when (seq blocks)
+      (state/exit-editing-and-set-selected-blocks! blocks))))
+
+(def *swipe (atom nil))
+(def *touch-start (atom nil))
+
+(defn- target-disable-swipe?
+  [target]
+  (let [user-defined-tags (get-in (state/get-config)
+                                  [:mobile :gestures/disabled-in-block-with-tags])]
+    (or (.closest target ".dsl-query")
+        (.closest target ".drawer")
+        (.closest target ".draw-wrap")
+        (some #(.closest target (util/format "[data-refs-self*=%s]" %))
+              user-defined-tags))))
+
+(defn on-touch-start
+  [event uuid]
+  (let [target (.-target event)
+        input (state/get-input)
+        input-id (state/get-edit-input-id)
+        selection-type (.-type (.getSelection js/document))]
+    (reset! *touch-start (js/Date.now))
+    (when-not (and input
+                   (string/ends-with? input-id (str uuid)))
+      (state/clear-edit!))
+    (when-not (target-disable-swipe? target)
+      (when (not= selection-type "Range")
+        (when-let [touches (.-targetTouches event)]
+          (when (= (.-length touches) 1)
+            (let [touch (aget touches 0)
+                  x (.-clientX touch)
+                  y (.-clientY touch)]
+              (reset! *swipe {:x0 x :y0 y :xi x :yi y :tx x :ty y :direction nil}))))))))
+
+(defn on-touch-move
+  [event block uuid edit? *show-left-menu? *show-right-menu?]
+  (when-let [touches (.-targetTouches event)]
+    (let [selection-type (.-type (.getSelection js/document))]
+      (when-not (= selection-type "Range")
+        (when (or (not (state/sub :editor/editing?))
+                  (< (- (js/Date.now) @*touch-start) 600))
+          (when (and (= (.-length touches) 1) @*swipe)
+            (let [{:keys [x0 xi direction]} @*swipe
+                  touch (aget touches 0)
+                  tx (.-clientX touch)
+                  ty (.-clientY touch)
+                  direction (if (nil? direction)
+                              (if (> tx x0)
+                                :right
+                                :left)
+                              direction)]
+              (swap! *swipe #(-> %
+                                 (assoc :tx tx)
+                                 (assoc :ty ty)
+                                 (assoc :xi tx)
+                                 (assoc :yi ty)
+                                 (assoc :direction direction)))
+              (when (< (* (- xi x0) (- tx xi)) 0)
+                (swap! *swipe #(-> %
+                                   (assoc :x0 tx)
+                                   (assoc :y0 ty))))
+              (let [{:keys [x0 y0]} @*swipe
+                    dx (- tx x0)
+                    dy (- ty y0)]
+                (when (and (< (. js/Math abs dy) 30)
+                           (> (. js/Math abs dx) 30))
+                  (let [left (gdom/getElement (str "block-left-menu-" uuid))
+                        right (gdom/getElement (str "block-right-menu-" uuid))]
+
+                    (cond
+                      (= direction :right)
+                      (do
+                        (reset! *show-left-menu? true)
+                        (when left
+                          (when (>= dx 0)
+                            (set! (.. left -style -width) (str dx "px")))
+                          (when (< dx 0)
+                            (set! (.. left -style -width) (str (max (+ 40 dx) 0) "px")))
+
+                          (let [indent (gdom/getFirstElementChild left)]
+                            (when (indentable? block)
+                              (if (>= (.-clientWidth left) 40)
+                                (set! (.. indent -style -opacity) "100%")
+                                (set! (.. indent -style -opacity) "30%"))))))
+
+                      (= direction :left)
+                      (do
+                        (reset! *show-right-menu? true)
+                        (when right
+                          (when (<= dx 0)
+                            (set! (.. right -style -width) (str (- dx) "px")))
+                          (when (> dx 0)
+                            (set! (.. right -style -width) (str (max (- 80 dx) 0) "px")))
+
+                          (let [outdent (gdom/getFirstElementChild right)
+                                more (when-not edit?
+                                       (gdom/getLastElementChild right))]
+                            (when (and outdent (outdentable? block))
+                              (if (and (>= (.-clientWidth right) 40)
+                                       (< (.-clientWidth right) 80))
+                                (set! (.. outdent -style -opacity) "100%")
+                                (set! (.. outdent -style -opacity) "30%")))
+
+                            (when more
+                              (if (>= (.-clientWidth right) 80)
+                                (set! (.. more -style -opacity) "100%")
+                                (set! (.. more -style -opacity) "30%"))))))
+                      :else
+                      nil)))))))))))
+
+(defn on-touch-end
+  [_event block uuid *show-left-menu? *show-right-menu?]
+  (when @*swipe
+    (let [left-menu (gdom/getElement (str "block-left-menu-" uuid))
+          right-menu (gdom/getElement (str "block-right-menu-" uuid))
+          {:keys [x0 tx]} @*swipe
+          dx (- tx x0)]
+      (try
+        (when (> (. js/Math abs dx) 10)
           (cond
-            (empty? children)
-            (recur others (list item))
+            (and left-menu (>= (.-clientWidth left-menu) 40))
+            (when (indentable? block)
+              (haptics/with-haptics-impact
+                (indent-outdent-block! block :right)
+                :light))
 
-            (<= bottom-level cur-level)
-            (recur others (conj children item))
+            (and right-menu (<= 40 (.-clientWidth right-menu) 79))
+            (when (outdentable? block)
+              (haptics/with-haptics-impact
+                (indent-outdent-block! block :left)
+                :light))
 
-            pre-block?
-            (recur others (cons item children))
+            (and right-menu (>= (.-clientWidth right-menu) 80))
+            (haptics/with-haptics-impact
+              (do (state/set-state! :mobile/show-action-bar? true)
+                  (state/set-state! :mobile/actioned-block block)
+                  (select-block! uuid))
+              :light)
 
-            (> bottom-level cur-level)      ; parent
-            (let [[children other-children] (split-with (fn [h]
-                                                          (> (:block/level h) cur-level))
-                                                        children)
-                  refs-with-children (->> (mapcat get-all-refs (cons item children))
-                                          (remove nil?)
-                                          distinct)
-                  children (cons
-                            (assoc item
-                                   :block/children children
-                                   :block/refs-with-children refs-with-children)
-                            other-children)]
-              (recur others children))))))))
+            :else
+            nil))
+        (catch :default e
+          (js/console.error e))
+        (finally
+          (reset! *show-left-menu? false)
+          (reset! *show-right-menu? false)
+          (reset! *swipe nil))))))
 
-;; recursively with children content for tree
-(defn get-block-content-rec
-  ([block]
-   (get-block-content-rec block (fn [block] (:block/content block))))
-  ([block transform-fn]
-   (let [contents (atom [])
-         _ (walk/prewalk
-            (fn [form]
-              (when (map? form)
-                (when-let [content (:block/content form)]
-                  (swap! contents conj (transform-fn form))))
-              form)
-            block)]
-     (apply util/join-newline @contents))))
+(defn on-touch-cancel
+  [*show-left-menu? *show-right-menu?]
+  (reset! *show-left-menu? false)
+  (reset! *show-right-menu? false)
+  (reset! *swipe nil))
 
-;; with children content
-(defn get-block-full-content
-  ([repo block-id]
-   (get-block-full-content repo block-id (fn [block] (:block/content block))))
-  ([repo block-id transform-fn]
-   (let [blocks (db/get-block-and-children-no-cache repo block-id)]
-     (->> blocks
-          (map transform-fn)
-          (apply util/join-newline)))))
+(defn get-blocks-refed-pages
+  [aliases [block & children]]
+  (let [children-refs (mapcat :block/refs children)
+        refs (->>
+              (:block/path-refs block)
+              (concat children-refs)
+              (remove #(aliases (:db/id %))))]
+    (keep (fn [ref]
+            (when (:block/name ref)
+              {:db/id (:db/id ref)
+               :block/name (:block/name ref)
+               :block/original-name (:block/original-name ref)})) refs)))
 
-(defn get-block-end-pos-rec
-  [repo block]
-  (let [children (:block/children block)]
-    (if (seq children)
-      (get-block-end-pos-rec repo (last children))
-      (if-let [end-pos (get-in block [:block/meta :end-pos])]
-        end-pos
-        (when-let [block (db/entity repo [:block/uuid (:block/uuid block)])]
-          (get-in block [:block/meta :end-pos]))))))
+(defn filter-blocks
+  [ref-blocks filters]
+  (if (empty? filters)
+    ref-blocks
+    (let [exclude-ids (->> (keep (fn [page] (:db/id (db/entity [:block/name (util/page-name-sanity-lc page)]))) (get filters false))
+                           (set))
+          include-ids (->> (keep (fn [page] (:db/id (db/entity [:block/name (util/page-name-sanity-lc page)]))) (get filters true))
+                           (set))]
+      (cond->> ref-blocks
+        (seq exclude-ids)
+        (remove (fn [block]
+                  (let [ids (set (map :db/id (:block/path-refs block)))]
+                    (seq (set/intersection exclude-ids ids)))))
 
-(defn get-block-ids
-  [block]
-  (let [ids (atom [])
-        _ (walk/prewalk
-           (fn [form]
-             (when (map? form)
-               (when-let [id (:block/uuid form)]
-                 (swap! ids conj id)))
-             form)
-           block)]
-    @ids))
+        (seq include-ids)
+        (filter (fn [block]
+                  (let [ids (set (map :db/id (:block/path-refs block)))]
+                    (set/subset? include-ids ids))))))))
 
-(defn collapse-block!
-  [block]
-  (let [repo (:block/repo block)]
-    (db/transact! repo
-                  [{:block/uuid (:block/uuid block)
-                    :block/collapsed? true}])))
+(defn get-filtered-ref-blocks-with-parents
+  [all-ref-blocks filtered-ref-blocks]
+  (when (seq filtered-ref-blocks)
+    (let [id->block (zipmap (map :db/id all-ref-blocks) all-ref-blocks)
+          get-parents (fn [block]
+                        (loop [block block
+                               result [block]]
+                          (let [parent (id->block (:db/id (:block/parent block)))]
+                            (if (and parent (not= (:db/id parent) (:db/id block)))
+                              (recur parent (conj result parent))
+                              result))))]
+      (distinct (mapcat get-parents filtered-ref-blocks)))))
 
-(defn collapse-blocks!
-  [block-ids]
-  (let [repo (state/get-current-repo)]
-    (db/transact! repo
-                  (map
-                   (fn [id]
-                     {:block/uuid id
-                      :block/collapsed? true})
-                   block-ids))))
+(defn get-idx-of-order-list-block
+  [block order-list-type]
+  (let [order-block-fn? #(some-> % :block/properties :logseq.order-list-type (= order-list-type))
+        prev-block-fn   #(some->> (:db/id %) (db-model/get-prev-sibling (state/get-current-repo)))
+        prev-block      (prev-block-fn block)]
+    (letfn [(page-fn? [b] (some-> b :block/name some?))
+            (order-sibling-list [b]
+              (lazy-seq
+                (when (and (not (page-fn? b)) (order-block-fn? b))
+                  (cons b (order-sibling-list (prev-block-fn b))))))
+            (order-parent-list [b]
+              (lazy-seq
+                (when (and (not (page-fn? b)) (order-block-fn? b))
+                  (cons b (order-parent-list (db-model/get-block-parent (:block/uuid b)))))))]
+      (let [idx           (if prev-block
+                            (count (order-sibling-list block)) 1)
+            order-parents-count (dec (count (order-parent-list block)))
+            delta (if (neg? order-parents-count) 0 (mod order-parents-count 3))]
+        (cond
+          (zero? delta) idx
 
-(defn expand-block!
-  [block]
-  (let [repo (:block/repo block)]
-    (db/transact! repo
-                  [{:block/uuid (:block/uuid block)
-                    :block/collapsed? false}])))
+          (= delta 1)
+          (some-> (util/convert-to-letters idx) util/safe-lower-case)
 
-(defn expand-blocks!
-  [block-ids]
-  (let [repo (state/get-current-repo)]
-    (db/transact! repo
-                  (map
-                   (fn [id]
-                     {:block/uuid id
-                      :block/collapsed? false})
-                   block-ids))))
+          :else
+          (util/convert-to-roman idx))))))
 
-(defn pre-block-with-only-title?
-  [repo block-id]
-  (when-let [block (db/entity repo [:block/uuid block-id])]
-    (let [properties (:page/properties (:block/page block))]
-      (and (:title properties)
-           (= 1 (count properties))
-           (let [ast (mldoc/->edn (:block/content block) (mldoc/default-config (:block/format block)))]
-             (or
-              (empty? (rest ast))
-              (every? (fn [[[typ break-lines]] _]
-                        (and (= typ "Paragraph")
-                             (every? #(= % ["Break_Line"]) break-lines))) (rest ast))))))))
-
-(defn with-dummy-block
-  ([blocks format]
-   (with-dummy-block blocks format {} {}))
-  ([blocks format default-option {:keys [journal? page-name]
-                                  :or {journal? false}}]
-   (let [format (or format (state/get-preferred-format) :markdown)
-         blocks (if (and journal?
-                         (seq blocks)
-                         (when-let [title (second (first (:block/title (first blocks))))]
-                           (date/valid-journal-title? title)))
-                  (rest blocks)
-                  blocks)
-         blocks (vec blocks)]
-     (cond
-       (and (seq blocks)
-            (or (and (> (count blocks) 1)
-                     (:block/pre-block? (first blocks)))
-                (and (>= (count blocks) 1)
-                     (not (:block/pre-block? (first blocks))))))
-       blocks
-
-       :else
-       (let [last-block (last blocks)
-             end-pos (get-in last-block [:block/meta :end-pos] 0)
-             dummy (merge last-block
-                          (let [uuid (d/squuid)]
-                            {:block/uuid uuid
-                             :block/title ""
-                             :block/content (config/default-empty-block format)
-                             :block/format format
-                             :block/level 2
-                             :block/priority nil
-                             :block/anchor (str uuid)
-                             :block/meta {:start-pos end-pos
-                                          :end-pos end-pos}
-                             :block/body nil
-                             :block/dummy? true
-                             :block/marker nil
-                             :block/pre-block? false})
-                          default-option)]
-         (conj blocks dummy))))))
+(defn attach-order-list-state
+  [config block]
+  (let [own-order-list-type  (some-> block :block/properties :logseq.order-list-type str string/lower-case)
+        own-order-list-index (some->> own-order-list-type (get-idx-of-order-list-block block))]
+    (assoc config :own-order-list-type own-order-list-type
+                  :own-order-list-index own-order-list-index
+                  :own-order-number-list? (= own-order-list-type "number"))))

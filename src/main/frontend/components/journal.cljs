@@ -1,124 +1,89 @@
 (ns frontend.components.journal
-  (:require [rum.core :as rum]
-            [reitit.frontend.easy :as rfe]
-            [frontend.util :as util :refer-macros [profile]]
-            [frontend.config :as config]
-            [frontend.date :as date]
-            [frontend.db-mixins :as db-mixins]
-            [frontend.handler.notification :as notification]
-            [frontend.handler.page :as page-handler]
-            [frontend.handler.editor :as editor-handler]
-            [frontend.db :as db]
-            [frontend.db.model :as model]
-            [frontend.state :as state]
-            [frontend.ui :as ui]
-            [frontend.config :as config]
-            [frontend.components.content :as content]
-            [frontend.components.block :as block]
-            [frontend.components.editor :as editor]
-            [frontend.components.reference :as reference]
+  (:require [clojure.string :as string]
             [frontend.components.page :as page]
-            [frontend.components.widgets :as widgets]
-            [frontend.components.onboarding :as onboarding]
+            [frontend.components.reference :as reference]
+            [frontend.components.scheduled-deadlines :as scheduled]
+            [frontend.date :as date]
+            [frontend.db :as db]
+            [frontend.db-mixins :as db-mixins]
+            [frontend.db.model :as model]
+            [frontend.handler.page :as page-handler]
+            [frontend.state :as state]
+            [logseq.graph-parser.util :as gp-util]
+            [frontend.ui :as ui]
+            [frontend.util :as util]
+            [frontend.util.text :as text-util]
             [goog.object :as gobj]
-            [clojure.string :as string]
-            [frontend.handler.block :as block-handler]
-            [frontend.text :as text]))
-
-(rum/defc blocks-inner < rum/static
-  {:did-mount (fn [state]
-                (let [[blocks page] (:rum/args state)
-                      first-title (second (first (:block/title (first blocks))))
-                      journal? (and (string? first-title)
-                                    (date/valid-journal-title? first-title))]
-                  (when (and journal?
-                             (= (string/lower-case first-title) (string/lower-case page)))
-                    (notification/show!
-                     [:div
-                      [:p
-                       (util/format
-                        "It seems that you have multiple journals for the same day \"%s\"."
-                        first-title)]
-                      (ui/button "Go to files"
-                                 :href "/all-files"
-                                 :on-click notification/clear!)]
-                     :error
-                     false)))
-                state)}
-  [blocks page document-mode?]
-  (let [start-level (or (:block/level (first blocks)) 1)
-        config {:id page
-                :start-level 2
-                :editor-box editor/box
-                :document/mode? document-mode?}]
-    (content/content
-     page
-     {:hiccup (block/->hiccup blocks config {})})))
+            [reitit.frontend.easy :as rfe]
+            [rum.core :as rum]))
 
 (rum/defc blocks-cp < rum/reactive db-mixins/query
   {}
-  [repo page format]
-  (let [raw-blocks (db/get-page-blocks repo page)
-        document-mode? (state/sub :document/mode?)
-        blocks (->>
-                (block-handler/with-dummy-block raw-blocks format nil {:journal? true})
-                (db/with-block-refs-count repo))]
-    (blocks-inner blocks page document-mode?)))
+  [repo page]
+  (when-let [page-e (db/pull [:block/name (util/page-name-sanity-lc page)])]
+    (page/page-blocks-cp repo page-e {})))
 
 (rum/defc journal-cp < rum/reactive
-  [[title format]]
+  [title]
   (let [;; Don't edit the journal title
         page (string/lower-case title)
         repo (state/sub :git/current-repo)
-        encoded-page-name (util/encode-str page)
         today? (= (string/lower-case title)
                   (string/lower-case (date/journal-name)))
-        intro? (and (not (state/logged?))
-                    (not (config/local-db? repo))
-                    (not config/publishing?)
-                    today?)
-        page-entity (db/pull [:page/name (string/lower-case title)])
-        data-page-tags (when (seq (:page/tags page-entity))
-                         (let [page-names (model/get-page-names-by-ids (map :db/id (:page/tags page)))]
-                           (text/build-data-value page-names)))]
-    [:div.flex-1.journal.page (cond->
-                               {:class (if intro? "intro" "")}
+        page-entity (db/pull [:block/name (util/page-name-sanity-lc title)])
+        data-page-tags (when (seq (:block/tags page-entity))
+                         (let [page-names (model/get-page-names-by-ids (map :db/id (:block/tags page)))]
+                           (text-util/build-data-value page-names)))]
+    [:div.flex-1.journal.page (cond-> {}
                                 data-page-tags
                                 (assoc :data-page-tags data-page-tags))
+
      (ui/foldable
-      [:a.initial-color.title
+      [:a.initial-color.title.journal-title
        {:href     (rfe/href :page {:name page})
+        :on-mouse-down (fn [e]
+                         (when (util/right-click? e)
+                           (state/set-state! :page-title/context {:page page})))
         :on-click (fn [e]
                     (when (gobj/get e "shiftKey")
                       (when-let [page page-entity]
                         (state/sidebar-add-block!
                          (state/get-current-repo)
                          (:db/id page)
-                         :page
-                         {:page     page
-                          :journal? true}))
+                         :page))
                       (.preventDefault e)))}
        [:h1.title
-        (util/capitalize-all title)]]
+        (gp-util/capitalize-all title)]]
 
-      (blocks-cp repo page format))
+      (if today?
+        (blocks-cp repo page)
+        (ui/lazy-visible
+         (fn [] (blocks-cp repo page))
+         {:debug-id (str "journal-blocks " page)}))
 
-     (when intro? (widgets/add-graph))
+      {})
 
      (page/today-queries repo today? false)
 
-     (reference/references title false)
+     (when today?
+       (scheduled/scheduled-and-deadlines page))
 
-     (when intro? (onboarding/intro))]))
+     (rum/with-key
+       (reference/references title)
+       (str title "-refs"))]))
 
-(rum/defc journals
+(rum/defc journals < rum/reactive
   [latest-journals]
   [:div#journals
    (ui/infinite-list
-    (for [[journal-name format] latest-journals]
-      [:div.journal-item.content {:key journal-name}
-       (journal-cp [journal-name format])])
-    {:on-load (fn []
+    "main-content-container"
+    (for [{:block/keys [name]} latest-journals]
+      [:div.journal-item.content {:key name}
+       (journal-cp name)])
+    {:has-more (page-handler/has-more-journals?)
+     :more-class "text-4xl"
+     :on-top-reached page-handler/create-today-journal!
+     :on-load (fn []
                 (page-handler/load-more-journals!))})])
 
 (rum/defc all-journals < rum/reactive db-mixins/query

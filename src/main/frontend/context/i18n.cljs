@@ -1,32 +1,26 @@
 (ns frontend.context.i18n
+  "This ns is a system component that handles translation for the entire
+  application. The ns dependencies for this ns must be small since it is used
+  throughout the application."
   (:require [frontend.dicts :as dicts]
-            [rum.core :as rum]
+            [tongue.core :as tongue]
             [frontend.state :as state]))
 
-;; TODO
-;; - [x] Get the preffered language from state
-;; - [x] Update the preffered language
-;; - [x] Create t functiona which takes a keyword and returns text with the current preffered language
-;; - [x] Add fetch for local browser prefered language if user has set it already
-;; - [ ] Fetch prefered language from backend if user is logged in
+(def dicts (merge dicts/dicts {:tongue/fallback :en}))
 
-(defn fetch-local-language []
+(def translate
+  (tongue/build-translate dicts))
+
+(defn t
+  [& args]
+  (let [preferred-language (keyword (state/sub :preferred-language))]
+    (apply translate preferred-language args)))
+
+(defn- fetch-local-language []
   (.. js/window -navigator -language))
 
-(rum/defcontext *tongue-context*)
-
-(rum/defc tongue-provider [children]
-  (let [prefered-language (keyword (state/sub :preferred-language))
-        set-preferred-language state/set-preferred-language!
-        t (partial dicts/translate prefered-language)]
-    (if (nil? prefered-language)
-      (set-preferred-language (fetch-local-language))
-      :ok)
-    (rum/bind-context [*tongue-context* [t prefered-language set-preferred-language]]
-                      children)))
-
-(rum/defc use-tongue []
-  (rum/with-context [value *tongue-context*]
-    (if (nil? value)
-      (throw "use-i18n must be used within a i18n-provider")
-      value)))
+;; TODO: Fetch preferred language from backend if user is logged in
+(defn start []
+  (let [preferred-language (state/sub :preferred-language)]
+    (when (nil? preferred-language)
+      (state/set-preferred-language! (fetch-local-language)))))

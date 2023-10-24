@@ -1,9 +1,9 @@
 (ns frontend.mixins
+  "Rum mixins for use in components"
   (:require [rum.core :as rum]
             [goog.dom :as dom]
-            [goog.object :as gobj]
-            [frontend.keyboard :as keyboard]
-            [frontend.util :refer-macros [profile]])
+            [frontend.util :refer [profile] :as util]
+            [frontend.state :as state])
   (:import [goog.events EventHandler]))
 
 (defn detach
@@ -27,60 +27,35 @@
      (detach state)
      (dissoc state ::event-handler))})
 
-;; (defn timeout-mixin
-;;   "The setTimeout mixin."
-;;   [name t f]
-;;   {:will-mount
-;;    (fn [state]
-;;      (assoc state name (util/set-timeout t f)))
-;;    :will-unmount
-;;    (fn [state]
-;;      (let [timeout (get state name)]
-;;        (util/clear-timeout timeout)
-;;        (dissoc state name)))})
-
-;; (defn interval-mixin
-;;   "The setInterval mixin."
-;;   [name t f]
-;;   {:will-mount
-;;    (fn [state]
-;;      (assoc state name (util/set-interval t f)))
-;;    :will-unmount
-;;    (fn [state]
-;;      (when-let [interval (get state name)]
-;;        (util/clear-interval interval))
-;;      (dissoc state name))})
-
 (defn hide-when-esc-or-outside
   [state & {:keys [on-hide node visibilitychange? outside?]}]
-  (try
-    (let [dom-node (rum/dom-node state)]
-      (when-let [dom-node (or node dom-node)]
-        (or (false? outside?)
-            (listen state js/window "mousedown"
-                    (fn [e]
-                      ;; If the click target is outside of current node
-                      (when-not (dom/contains dom-node (.. e -target))
-                        (on-hide state e :click)))))
-        (listen state js/window "keydown"
-                (fn [e]
-                  (case (.-keyCode e)
-                    ;; Esc
-                    27 (on-hide state e :esc)
-                    nil)))
-        (when visibilitychange?
-          (listen state js/window "visibilitychange"
+  (let [opts (last (:rum/args state))
+        outside? (cond-> opts (nil? outside?) (:outside?))]
+    (try
+      (let [dom-node (rum/dom-node state)]
+        (when-let [dom-node (or node dom-node)]
+          (let [click-fn (fn [e]
+                           (let [target (.. e -target)]
+                             ;; If the click target is outside of current node
+                             (when (and
+                                     (not (dom/contains dom-node target))
+                                     (not (.contains (.-classList target) "ignore-outside-event")))
+                               (on-hide state e :click))))]
+            (when-not (false? outside?)
+              (listen state js/window "mousedown" click-fn)))
+          (listen state js/window "keydown"
                   (fn [e]
-                    (on-hide state e :visibilitychange))))))
-    (catch js/Error e
-      ;; TODO: Unable to find node on an unmounted component.
-      nil)))
-
-(defn resize-layout
-  [state ref]
-  (listen state js/window "resize"
-          (fn [e]
-            (reset! ref [js/window.innerWidth js/window.innerHeight]))))
+                    (case (.-keyCode e)
+                      ;; Esc
+                      27 (on-hide state e :esc)
+                      nil)))
+          (when visibilitychange?
+            (listen state js/window "visibilitychange"
+                    (fn [e]
+                      (on-hide state e :visibilitychange))))))
+      (catch :default _e
+        ;; TODO: Unable to find node on an unmounted component.
+        nil))))
 
 (defn on-enter
   [state & {:keys [on-enter node]}]
@@ -94,28 +69,26 @@
 
 (defn on-key-up
   [state keycode-map all-handler]
-  (let [node (rum/dom-node state)]
-    (listen state js/window "keyup"
-            (fn [e]
-              (let [key-code (.-keyCode e)]
-                (when-let [f (get keycode-map key-code)]
-                  (f state e))
-                (when all-handler (all-handler e key-code)))))))
+  (listen state js/window "keyup"
+          (fn [e]
+            (let [key-code (.-keyCode e)]
+              (when-let [f (get keycode-map key-code)]
+                (f state e))
+              (when all-handler (all-handler e key-code))))))
 
 (defn on-key-down
   ([state keycode-map]
    (on-key-down state keycode-map {}))
-  ([state keycode-map {:keys [not-matched-handler all-handler]}]
-   (let [node (rum/dom-node state)]
-     (listen state js/window "keydown"
-             (fn [e]
-               (let [key-code (.-keyCode e)]
-                 (if-let [f (get keycode-map key-code)]
-                   (f state e)
-                   (when (and not-matched-handler (fn? not-matched-handler))
-                     (not-matched-handler e key-code)))
-                 (when (and all-handler (fn? all-handler))
-                   (all-handler e key-code))))))))
+  ([state keycode-map {:keys [not-matched-handler all-handler target]}]
+   (listen state (or target js/window) "keydown"
+           (fn [e]
+             (let [key-code (.-keyCode e)]
+               (if-let [f (get keycode-map key-code)]
+                 (f state e)
+                 (when (and not-matched-handler (fn? not-matched-handler))
+                   (not-matched-handler e key-code)))
+               (when (and all-handler (fn? all-handler))
+                 (all-handler e key-code)))))))
 
 (defn event-mixin
   ([attach-listeners]
@@ -123,15 +96,15 @@
   ([attach-listeners init-callback]
    (merge
     event-handler-mixin
-    {:init (fn [state props]
+    {:init (fn [state _props]
              (init-callback state))
      :did-mount (fn [state]
                   (attach-listeners state)
                   state)
-     :did-remount (fn [old-state new-state]
-                    (detach old-state)
-                    (attach-listeners new-state)
-                    new-state)})))
+     :will-remount (fn [old-state new-state]
+                     (detach old-state)
+                     (attach-listeners new-state)
+                     new-state)})))
 
 (defn modal
   [k]
@@ -158,42 +131,19 @@
               :toggle-fn (fn []
                            (swap! open? not)))))))
 
-(defn will-mount-effect
-  [handler]
-  {:will-mount (fn [state]
-                 (handler (:rum/args state))
-                 state)})
-
-(defn keyboard-mixin
-  "Triggers f when key is pressed while the component is mounted.
-   if target is a function it will be called AFTER the component mounted
-   with state and should return a dom node that is the target of the listener.
-   If no target is given it is defaulted to js/window (global handler)
-   Ex:
-     (keyboard-mixin \"esc\" #(browse-to :home/home))"
-  ([key f] (keyboard-mixin key f js/window))
-  ([key f target]
-   (let [target-fn (if (fn? target) target (fn [_] target))]
-     {:did-mount
-      (fn [state]
-        (assoc state (str (name ::keyboard-listener) key)
-               (keyboard/install-shortcut! key
-                                           (fn [e] (f state e))
-                                           false
-                                           (target-fn state))))
-      :will-unmount
-      (fn [state]
-        (let [k (str (name ::keyboard-listener) key)]
-          (when-let [f (get state k)]
-            (f))
-          (dissoc state k)))})))
-
-;; also, from https://github.com/tonsky/rum/blob/75174b9ea0cf4b7a761d9293929bd40c95d35f74/doc/useful-mixins.md
-
+(def component-editing-mode
+  {:will-mount
+   (fn [state]
+     (state/set-block-component-editing-mode! true)
+     state)
+   :will-unmount
+   (fn [state]
+     (state/set-block-component-editing-mode! false)
+     state)})
 
 (defn perf-measure-mixin
-  [desc]
   "Does performance measurements in development."
+  [desc]
   {:wrap-render
    (fn wrap-render [render-fn]
      (fn [state]

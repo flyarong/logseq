@@ -2,7 +2,16 @@ const path = require('path')
 
 module.exports = {
   packagerConfig: {
+    name: 'Logseq',
     icon: './icons/logseq_big_sur.icns',
+    buildVersion: 72,
+    protocols: [
+      {
+        "protocol": "logseq",
+        "name": "logseq",
+        "schemes": "logseq"
+      }
+    ],
     osxSign: {
       identity: 'Developer ID Application: Tiansheng Qin',
       'hardened-runtime': true,
@@ -11,8 +20,9 @@ module.exports = {
       'signature-flags': 'library'
     },
     osxNotarize: {
-      appleId: "my-fake-apple-id",
-      appleIdPassword: "my-fake-apple-id-password",
+      appleId: process.env['APPLE_ID'],
+      appleIdPassword: process.env['APPLE_ID_PASSWORD'],
+      ascProvider: process.env['APPLE_ASC_PROVIDER']
     },
   },
   makers: [
@@ -20,7 +30,11 @@ module.exports = {
       'name': '@electron-forge/maker-squirrel',
       'config': {
         'name': 'Logseq',
-        'setupIcon': './icons/logseq.ico'
+        'setupIcon': './icons/logseq.ico',
+        'loadingGif': './icons/installing.gif',
+        'certificateFile': process.env.CODE_SIGN_CERTIFICATE_FILE,
+        'certificatePassword': process.env.CODE_SIGN_CERTIFICATE_PASSWORD,
+        "rfc3161TimeStampServer": "http://timestamp.digicert.com"
       }
     },
     {
@@ -34,6 +48,13 @@ module.exports = {
     {
       name: '@electron-forge/maker-zip',
       platforms: ['darwin', 'linux']
+    },
+    {
+      name: 'electron-forge-maker-appimage',
+      platforms: ['linux'],
+      config: {
+        mimeType: ["x-scheme-handler/logseq"]
+      }
     }
   ],
 
