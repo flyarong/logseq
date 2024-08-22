@@ -68,6 +68,7 @@
                 nil)))))
 
 (defn on-key-up
+  "Caution: This mixin uses a different args than on-key-down"
   [state keycode-map all-handler]
   (listen state js/window "keyup"
           (fn [e]
@@ -79,16 +80,17 @@
 (defn on-key-down
   ([state keycode-map]
    (on-key-down state keycode-map {}))
-  ([state keycode-map {:keys [not-matched-handler all-handler target]}]
+  ([state keycode-map {:keys [not-matched-handler all-handler target keycode?]
+                       :or {keycode? true}}]
    (listen state (or target js/window) "keydown"
            (fn [e]
-             (let [key-code (.-keyCode e)]
-               (if-let [f (get keycode-map key-code)]
+             (let [key (if keycode? (.-keyCode e) (.-key e))]
+               (if-let [f (get keycode-map key)]
                  (f state e)
                  (when (and not-matched-handler (fn? not-matched-handler))
-                   (not-matched-handler e key-code)))
+                   (not-matched-handler e key)))
                (when (and all-handler (fn? all-handler))
-                 (all-handler e key-code)))))))
+                 (all-handler e key)))))))
 
 (defn event-mixin
   ([attach-listeners]

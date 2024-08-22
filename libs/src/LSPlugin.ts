@@ -141,7 +141,7 @@ export interface AppUserInfo {
 export interface AppInfo {
   version: string
 
-  [key: string]: any
+  [key: string]: unknown
 }
 
 /**
@@ -159,6 +159,8 @@ export interface AppUserConfigs {
   showBracket: boolean
   enabledFlashcards: boolean
   enabledJournals: boolean
+
+  [key: string]: unknown
 }
 
 /**
@@ -168,6 +170,8 @@ export interface AppGraphInfo {
   name: string
   url: string
   path: string
+
+  [key: string]: unknown
 }
 
 /**
@@ -192,7 +196,9 @@ export interface BlockEntity {
   level?: number
   meta?: { timestamps: any; properties: any; startPos: number; endPos: number }
   title?: Array<any>
-	marker?: string
+  marker?: string
+
+  [key: string]: unknown
 }
 
 /**
@@ -212,6 +218,8 @@ export interface PageEntity {
   format?: 'markdown' | 'org'
   journalDay?: number
   updatedAt?: number
+
+  [key: string]: unknown
 }
 
 export type BlockIdentity = BlockUUID | Pick<BlockEntity, 'uuid'>
@@ -235,9 +243,10 @@ export type BlockCursorPosition = {
   rect: DOMRect
 }
 
+export type Keybinding = string | Array<string>
 export type SimpleCommandKeybinding = {
   mode?: 'global' | 'non-editing' | 'editing'
-  binding: string
+  binding: Keybinding
   mac?: string // special for Mac OS
 }
 
@@ -275,7 +284,6 @@ export type ExternalCommandType =
   | 'logseq.go/next-journal'
   | 'logseq.go/prev-journal'
   | 'logseq.go/search'
-  | 'logseq.go/search-in-page'
   | 'logseq.go/tomorrow'
   | 'logseq.go/backward'
   | 'logseq.go/forward'
@@ -285,7 +293,6 @@ export type ExternalCommandType =
   | 'logseq.ui/goto-plugins'
   | 'logseq.ui/select-theme-color'
   | 'logseq.ui/toggle-brackets'
-  | 'logseq.ui/toggle-cards'
   | 'logseq.ui/toggle-contents'
   | 'logseq.ui/toggle-document-mode'
   | 'logseq.ui/toggle-help'
@@ -294,7 +301,6 @@ export type ExternalCommandType =
   | 'logseq.ui/toggle-settings'
   | 'logseq.ui/toggle-theme'
   | 'logseq.ui/toggle-wide-mode'
-  | 'logseq.command-palette/toggle'
 
 export type UserProxyTags = 'app' | 'editor' | 'db' | 'git' | 'ui' | 'assets'
 
@@ -471,25 +477,6 @@ export interface IAppProxy {
   ) => Promise<any>
   removeTemplate: (name: string) => Promise<any>
   insertTemplate: (target: BlockUUID, name: string) => Promise<any>
-
-  // ui
-  queryElementById: (id: string) => Promise<string | boolean>
-
-  /**
-   * @added 0.0.5
-   * @param selector
-   */
-  queryElementRect: (selector: string) => Promise<DOMRectReadOnly | null>
-
-  /**
-   * @deprecated Use `logseq.UI.showMsg` instead
-   * @param content
-   * @param status
-   */
-  showMsg: (
-    content: string,
-    status?: 'success' | 'warning' | 'error' | string
-  ) => void
 
   setZoomFactor: (factor: number) => void
   setFullScreen: (flag: boolean | 'toggle') => void
@@ -894,20 +881,16 @@ export type UIMsgOptions = {
 export type UIMsgKey = UIMsgOptions['key']
 
 export interface IUIProxy {
-  /**
-   * @added 0.0.2
-   *
-   * @param content
-   * @param status
-   * @param opts
-   */
   showMsg: (
     content: string,
     status?: 'success' | 'warning' | 'error' | string,
     opts?: Partial<UIMsgOptions>
   ) => Promise<UIMsgKey>
-
   closeMsg: (key: UIMsgKey) => void
+  queryElementRect: (selector: string) => Promise<DOMRectReadOnly | null>
+  queryElementById: (id: string) => Promise<string | boolean>
+  checkSlotValid: (slot: UISlotIdentity['slot']) => Promise<boolean>
+  resolveThemeCssPropsVals: (props: string | Array<string>) => Promise<Record<string, string | undefined> | null>
 }
 
 /**
@@ -941,6 +924,13 @@ export interface IAssetsProxy {
    * @param path
    */
   makeUrl(path: string): Promise<string>
+
+  /**
+   * try to open asset type file in Logseq app
+   * @added 0.0.16
+   * @param path
+   */
+  builtInOpen(path: string): Promise<boolean | undefined>
 }
 
 export interface ILSPluginThemeManager {

@@ -5,20 +5,22 @@
   (:refer-clojure :exclude [run!])
   (:require ["@capacitor/filesystem" :refer [Directory Filesystem]]
             ["@sentry/react" :as Sentry]
+            [electron.ipc :as ipc]
+            [frontend.idb :as idb]
             [cljs-bean.core :as bean]
             [clojure.core.async :as async]
             [clojure.core.async.interop :refer [p->c]]
             [clojure.set :as set]
             [clojure.string :as string]
             [frontend.commands :as commands]
-            [frontend.components.command-palette :as command-palette]
+            [frontend.components.cmdk :as cmdk]
             [frontend.components.conversion :as conversion-component]
+            [frontend.components.settings :as settings]
             [frontend.components.diff :as diff]
             [frontend.components.encryption :as encryption]
             [frontend.components.file-sync :as file-sync]
             [frontend.components.git :as git-component]
             [frontend.components.plugins :as plugin]
-            [frontend.components.search :as component-search]
             [frontend.components.shell :as shell]
             [frontend.components.whiteboard :as whiteboard]
             [frontend.components.user.login :as login]
@@ -34,7 +36,6 @@
             [frontend.fs.nfs :as nfs]
             [frontend.fs.sync :as sync]
             [frontend.fs.watcher-handler :as fs-watcher]
-            [frontend.handler.command-palette :as cp]
             [frontend.handler.common :as common-handler]
             [frontend.handler.editor :as editor-handler]
             [frontend.handler.file :as file-handler]
@@ -123,7 +124,9 @@
 (defmethod handle :user/login [[_ host-ui?]]
   (if (or host-ui? (not util/electron?))
     (js/window.open config/LOGIN-URL)
-    (login/open-login-modal!)))
+    (if (mobile-util/native-platform?)
+      (route-handler/redirect! {:to :user-login})
+      (login/open-login-modal!))))
 
 (defmethod handle :graph/added [[_ repo {:keys [empty-graph?]}]]
   (db/set-key-value repo :ast/version db-schema/ast-version)
@@ -181,16 +184,16 @@
           (repo-handler/broadcast-persist-db! graph))))
      (repo-handler/restore-and-setup-repo! graph)
      (graph-switch graph)
-     state/set-state! :sync-graph/init? false)))
+     (state/set-state! :sync-graph/init? false))))
 
 (defmethod handle :graph/switch [[_ graph opts]]
   (let [opts (if (false? (:persist? opts)) opts (assoc opts :persist? true))]
     (if (or (not (false? (get @outliner-file/*writes-finished? graph)))
-           (:sync-graph/init? @state/state))
+            (:sync-graph/init? @state/state))
       (graph-switch-on-persisted graph opts)
-     (notification/show!
-      "Please wait seconds until all changes are saved for the current graph."
-      :warning))))
+      (notification/show!
+       "Please wait seconds until all changes are saved for the current graph."
+       :warning))))
 
 (defmethod handle :graph/pull-down-remote-graph [[_ graph dir-name]]
   (if (mobile-util/native-ios?)
@@ -269,7 +272,7 @@
         (not (mobile-util/native-platform?)))
     (fn [close-fn]
       [:div
-       ;; TODO: fn translation with args
+      ;; TODO: fn translation with args
        [:p
         "Grant native filesystem permission for directory: "
         [:b (config/get-local-dir repo)]]
@@ -337,6 +340,17 @@
 (defmethod handle :modal/show-themes-modal [_]
   (plugin/open-select-theme!))
 
+(defmethod handle :modal/toggle-accent-colors-modal [_]
+  (let [label "accent-colors-picker"]
+    (if (or (= label (state/get-modal-id))
+          (= label (some-> (state/get-sub-modals) (first) :modal/id)))
+      (state/close-sub-modal! label)
+      (state/set-sub-modal!
+        #(settings/modal-accent-colors-inner)
+        {:center? true
+         :id      label
+         :label   label}))))
+
 (rum/defc modal-output
   [content]
   content)
@@ -365,8 +379,9 @@
       (state/set-modal! #(diff/local-file repo path disk-content db-content)
                         {:label "diff__cp"}))))
 
-(defmethod handle :modal/display-file-version [[_ path content hash]]
-  (state/set-modal! #(git-component/file-specific-version path hash content)))
+
+(defmethod handle :modal/display-file-version-selector  [[_ versions path  get-content]]
+  (state/set-modal! #(git-component/file-version-selector versions path get-content)))
 
 ;; Hook on a graph is ready to be shown to the user.
 ;; It's different from :graph/restored, as :graph/restored is for window reloaded
@@ -384,20 +399,7 @@
           _ (js/setTimeout #(mobile/mobile-postinit) 1000)
           ;; FIXME: an ugly implementation for redirecting to page on new window is restored
           _ (repo-handler/graph-ready! repo)
-          _ (fs-watcher/load-graph-files! repo loaded-homepage-files)]
-
-  ;; TODO(junyi): Notify user to update filename format when the UX is smooth enough
-  ;; (when-not config/test?
-  ;;   (js/setTimeout
-  ;;    (fn []
-  ;;      (let [filename-format (state/get-filename-format repo)]
-  ;;        (when (and (util/electron?)
-  ;;                   (not (util/ci?))
-  ;;                   (not (config/demo-graph?))
-  ;;                   (not= filename-format :triple-lowbar))
-  ;;          (state/pub-event! [:ui/notify-outdated-filename-format []]))))
-  ;;    3000))
-    ))
+          _ (fs-watcher/load-graph-files! repo loaded-homepage-files)]))
 
 (defmethod handle :notification/show [[_ {:keys [content status clear?]}]]
   (notification/show! content status clear?))
@@ -407,9 +409,10 @@
     (state/set-modal! shell/shell)))
 
 (defmethod handle :go/search [_]
-  (state/set-modal! component-search/search-modal
-                    {:fullscreen? false
+  (state/set-modal! cmdk/cmdk-modal
+                    {:fullscreen? true
                      :close-btn?  false
+                     :panel?      false
                      :label "ls-modal-search"}))
 
 (defmethod handle :go/plugins [_]
@@ -431,8 +434,8 @@
 
 (defmethod handle :go/proxy-settings [[_ agent-opts]]
   (state/set-sub-modal!
-    (fn [_] (plugin/user-proxy-settings-panel agent-opts))
-    {:id :https-proxy-panel :center? true}))
+   (fn [_] (plugin/user-proxy-settings-panel agent-opts))
+   {:id :https-proxy-panel :center? true}))
 
 
 (defmethod handle :redirect-to-home [_]
@@ -575,14 +578,14 @@
           (if-not error-code
             (plugin/set-updates-sub-content! (str title "...") 0)
             (notification/show!
-              (str "[Checked]<" title "> " error-code) :error)))))
+             (str "[Checked]<" title "> " error-code) :error)))))
 
     (if (and updated? downloading?)
       ;; try to start consume downloading item
       (if-let [next-coming (state/get-next-selected-coming-update)]
         (plugin-handler/check-or-update-marketplace-plugin!
-          (assoc next-coming :only-check false :error-code nil)
-          (fn [^js e] (js/console.error "[Download Err]" next-coming e)))
+         (assoc next-coming :only-check false :error-code nil)
+         (fn [^js e] (js/console.error "[Download Err]" next-coming e)))
         (plugin-handler/close-updates-downloading))
 
       ;; try to start consume pending item
@@ -590,11 +593,11 @@
         (do
           (println "Updates: take next pending - " (:id next-pending))
           (js/setTimeout
-            #(plugin-handler/check-or-update-marketplace-plugin!
-               (assoc next-pending :only-check true :auto-check auto-checking? :error-code nil)
-               (fn [^js e]
-                 (notification/show! (.toString e) :error)
-                 (js/console.error "[Check Err]" next-pending e))) 500))
+           #(plugin-handler/check-or-update-marketplace-plugin!
+             (assoc next-pending :only-check true :auto-check auto-checking? :error-code nil)
+             (fn [^js e]
+               (notification/show! (.toString e) :error)
+               (js/console.error "[Check Err]" next-pending e))) 500))
 
         ;; try to open waiting updates list
         (do (when (and prev-pending? (not auto-checking?)
@@ -619,7 +622,7 @@
         payload (js->clj event :keywordize-keys true)]
     (fs-watcher/handle-changed! type payload)
     (when (file-sync-handler/enable-sync?)
-     (sync/file-watch-handler type payload))))
+      (sync/file-watch-handler type payload))))
 
 (defmethod handle :rebuild-slash-commands-list [[_]]
   (page-handler/rebuild-slash-commands-list!))
@@ -640,7 +643,6 @@
       (t :yes)
       :autoFocus "on"
       :class "ui__modal-enter"
-      :large? true
       :on-click (fn []
                   (state/close-modal!)
                   (nfs-handler/refresh! (state/get-current-repo) refresh-cb)))]]))
@@ -661,7 +663,7 @@
                                           :GraphName graph-name
                                           :remote? true)
                                    r))
-                            (state/get-repos)))))))
+                               (state/get-repos)))))))
 
 (defmethod handle :graph/re-index [[_]]
   ;; Ensure the graph only has ONE window instance
@@ -671,6 +673,22 @@
      nfs-handler/rebuild-index!
      #(do (page-handler/create-today-journal!)
           (file-sync-restart!)))))
+
+;; FIXME: move
+(defn- clear-cache!
+  []
+  (notification/show! "Clearing..." :warning false)
+  (p/let [_ (when (util/electron?)
+              (ipc/ipc "clearCache"))
+          _ (idb/clear-local-storage-and-idb!)]
+    (js/setTimeout
+      (fn [] (if (util/electron?)
+               (ipc/ipc :reloadWindowPage)
+               (js/window.location.reload)))
+      2000)))
+
+(defmethod handle :graph/clear-cache! [[_]]
+  (clear-cache!))
 
 (defmethod handle :graph/ask-for-re-index [[_ *multiple-windows? ui]]
   ;; *multiple-windows? - if the graph is opened in multiple windows, boolean atom
@@ -687,13 +705,12 @@
        (when (not (nil? ui)) ui)
        [:p (t :re-index-discard-unsaved-changes-warning)]
        (ui/button
-         (t :yes)
-         :autoFocus "on"
-         :class "ui__modal-enter"
-         :large? true
-         :on-click (fn []
-                     (state/close-modal!)
-                     (state/pub-event! [:graph/re-index])))]])))
+        (t :yes)
+        :autoFocus "on"
+        :class "ui__modal-enter"
+        :on-click (fn []
+                    (state/close-modal!)
+                    (state/pub-event! [:graph/re-index])))]])))
 
 (defmethod handle :modal/remote-encryption-input-pw-dialog [[_ repo-url remote-graph-info type opts]]
   (state/set-modal!
@@ -704,12 +721,6 @@
                          :repo repo-url)
                   opts))
    {:center? true :close-btn? false :close-backdrop? false}))
-
-(defmethod handle :modal/command-palette [_]
-  (state/set-modal!
-   #(command-palette/command-palette {:commands (cp/get-commands)})
-   {:fullscreen? false
-    :close-btn?  false}))
 
 (defmethod handle :journal/insert-template [[_ page-name]]
   (let [page-name (util/page-name-sanity-lc page-name)]
@@ -885,17 +896,17 @@
          [:p
           "Or, let me"
           (ui/button "Fix"
-            :on-click (fn []
-                        (let [dir (config/get-repo-dir repo)]
-                          (p/let [content (fs/read-file dir file)]
-                            (let [new-content (string/replace content (str id) (str (random-uuid)))]
-                              (p/let [_ (fs/write-file! repo
-                                                        dir
-                                                        file
-                                                        new-content
-                                                        {})]
-                                (reset! resolved? true))))))
-            :class "inline mx-1")
+                     :on-click (fn []
+                                 (let [dir (config/get-repo-dir repo)]
+                                   (p/let [content (fs/read-file dir file)]
+                                     (let [new-content (string/replace content (str id) (str (random-uuid)))]
+                                       (p/let [_ (fs/write-file! repo
+                                                                 dir
+                                                                 file
+                                                                 new-content
+                                                                 {})]
+                                         (reset! resolved? true))))))
+                     :class "inline mx-1")
           "it."]])]]))
 
 (defmethod handle :file/parse-and-load-error [[_ repo parse-errors]]
@@ -907,18 +918,18 @@
                         (for [[file error] parse-errors]
                           (let [data (ex-data error)]
                             (cond
-                             (and (gp-config/whiteboard? file)
-                                  (= :transact/upsert (:error data))
-                                  (uuid? (last (:assertion data))))
-                             (rum/with-key (file-id-conflict-item repo file data) file)
+                              (and (gp-config/whiteboard? file)
+                                   (= :transact/upsert (:error data))
+                                   (uuid? (last (:assertion data))))
+                              (rum/with-key (file-id-conflict-item repo file data) file)
 
-                             :else
-                             (do
-                               (state/pub-event! [:capture-error {:error error
-                                                                  :payload {:type :file/parse-and-load-error}}])
-                               [:li.my-1 {:key file}
-                                [:a {:on-click #(js/window.apis.openPath file)} file]
-                                [:p (.-message error)]]))))]
+                              :else
+                              (do
+                                (state/pub-event! [:capture-error {:error error
+                                                                   :payload {:type :file/parse-and-load-error}}])
+                                [:li.my-1 {:key file}
+                                 [:a {:on-click #(js/window.apis.openPath file)} file]
+                                 [:p (.-message error)]]))))]
                        [:p "Don't forget to re-index your graph when all the conflicts are resolved."]]
                       :status :error}]))
 
@@ -941,8 +952,8 @@
 (defmethod handle :editor/toggle-own-number-list [[_ blocks]]
   (let [batch? (sequential? blocks)
         blocks (cond->> blocks
-                  batch?
-                  (map #(cond-> % (or (uuid? %) (string? %)) (db-model/get-block-by-uuid))))]
+                 batch?
+                 (map #(cond-> % (or (uuid? %) (string? %)) (db-model/get-block-by-uuid))))]
     (if (and batch? (> (count blocks) 1))
       (editor-handler/toggle-blocks-as-own-order-list! blocks)
       (when-let [block (cond-> blocks batch? (first))]
@@ -986,5 +997,4 @@
   (def deprecated-repo (state/get-current-repo))
   (def new-repo (string/replace deprecated-repo deprecated-app-id current-app-id))
 
-  (update-file-path deprecated-repo new-repo deprecated-app-id current-app-id)
-  )
+  (update-file-path deprecated-repo new-repo deprecated-app-id current-app-id))

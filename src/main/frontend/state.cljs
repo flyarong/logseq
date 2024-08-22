@@ -2,19 +2,20 @@
   "Provides main application state, fns associated to set and state based rum
   cursors"
   (:require [cljs-bean.core :as bean]
-            [cljs.core.async :as async :refer [<!]]
+            [cljs.core.async :as async :refer [<! >!]]
             [cljs.spec.alpha :as s]
             [clojure.string :as string]
             [dommy.core :as dom]
             [electron.ipc :as ipc]
             [frontend.mobile.util :as mobile-util]
-            [frontend.storage :as storage]
             [frontend.spec.storage :as storage-spec]
+            [frontend.storage :as storage]
             [frontend.util :as util]
             [frontend.util.cursor :as cursor]
             [goog.dom :as gdom]
             [goog.object :as gobj]
             [logseq.graph-parser.config :as gp-config]
+            [malli.core :as m]
             [medley.core :as medley]
             [promesa.core :as p]
             [rum.core :as rum]))
@@ -30,7 +31,12 @@
      :today                                 nil
      :system/events                         (async/chan 1000)
      :db/batch-txs                          (async/chan 1000)
-     :file/writes                           (async/chan 10000)
+     :file/writes                           (let [coercer (m/coercer [:catn
+                                                                      [:repo :string]
+                                                                      [:page-id :any]
+                                                                      [:outliner-op :any]
+                                                                      [:epoch :int]])]
+                                              (async/chan 10000 (map coercer)))
      :file/unlinked-dirs                    #{}
      :reactive/custom-queries               (async/chan 1000)
      :notification/show?                    false
@@ -50,7 +56,7 @@
      :journals-length                       3
 
      :search/q                              ""
-     :search/mode                           :global  ;; inner page or full graph? {:page :global}
+     :search/mode                           nil ; nil -> global mode, :graph -> add graph filter, etc.
      :search/result                         nil
      :search/graph-filters                  []
      :search/engines                        {}
@@ -74,6 +80,9 @@
      :ui/navigation-item-collapsed?         {}
 
      ;; right sidebar
+     :ui/handbooks-open?                    false
+     :ui/help-open?                         false
+     :ui/fullscreen?                        false
      :ui/settings-open?                     false
      :ui/sidebar-open?                      false
      :ui/sidebar-width                      "40%"
@@ -82,6 +91,7 @@
      :ui/system-theme?                      ((fnil identity (or util/mac? util/win32? false)) (storage/get :ui/system-theme?))
      :ui/custom-theme                       (or (storage/get :ui/custom-theme) {:light {:mode "light"} :dark {:mode "dark"}})
      :ui/wide-mode?                         (storage/get :ui/wide-mode)
+     :ui/radix-color                        (storage/get :ui/radix-color)
 
      ;; ui/collapsed-blocks is to separate the collapse/expand state from db for:
      ;; 1. right sidebar
@@ -220,6 +230,7 @@
      :pdf/current                           nil
      :pdf/ref-highlight                     nil
      :pdf/block-highlight-colored?          (or (storage/get "ls-pdf-hl-block-is-colored") true)
+     :pdf/auto-open-ctx-menu?               (not= false (storage/get "ls-pdf-auto-open-ctx-menu"))
 
      ;; all notification contents as k-v pairs
      :notification/contents                 {}
@@ -277,12 +288,14 @@
 
      :ui/loading?                           {}
      :feature/enable-sync?                  (storage/get :logseq-sync-enabled)
-     :feature/enable-sync-diff-merge?       (storage/get :logseq-sync-diff-merge-enabled)
+     :feature/enable-sync-diff-merge?       ((fnil identity true) (storage/get :logseq-sync-diff-merge-enabled))
 
      :file/rename-event-chan                (async/chan 100)
      :ui/find-in-page                       nil
      :graph/importing                       nil
      :graph/importing-state                 {}
+
+     :handbook/route-chan                   (async/chan (async/sliding-buffer 1))
 
      :whiteboard/onboarding-whiteboard?     (or (storage/get :ls-onboarding-whiteboard?) false)
      :whiteboard/onboarding-tour?           (or (storage/get :whiteboard-onboarding-tour?) false)
@@ -631,6 +644,10 @@ Similar to re-frame subscriptions"
   []
   (:graph/settings (sub-config)))
 
+(defn graph-forcesettings
+  []
+  (:graph/forcesettings (sub-config)))
+
 ;; Enable by default
 (defn show-brackets?
   []
@@ -900,10 +917,6 @@ Similar to re-frame subscriptions"
   [range]
   (set-state! :cursor-range range))
 
-(defn set-q!
-  [value]
-  (set-state! :search/q value))
-
 (defn set-search-mode!
   [value]
   (set-state! :search/mode value))
@@ -981,8 +994,7 @@ Similar to re-frame subscriptions"
 
 (defn set-selection-start-block!
   [start-block]
-  (when-not (get-selection-start-block)
-    (swap! state assoc :selection/start-block start-block)))
+  (swap! state assoc :selection/start-block start-block))
 
 (defn set-selection-blocks!
   ([blocks]
@@ -1033,13 +1045,26 @@ Similar to re-frame subscriptions"
   (and (in-selection-mode?) (seq (get-selection-blocks))))
 
 (defn conj-selection-block!
-  [block direction]
+  [block-or-blocks direction]
+  (let [selection-blocks (get-selection-blocks)
+        blocks (-> (if (sequential? block-or-blocks)
+                     (apply conj selection-blocks block-or-blocks)
+                     (conj selection-blocks block-or-blocks))
+                   distinct
+                   util/sort-by-height
+                   vec)]
+    (swap! state assoc
+           :selection/mode true
+           :selection/blocks blocks
+           :selection/direction direction)))
+
+(defn drop-selection-block!
+  [block]
   (swap! state assoc
          :selection/mode true
-         :selection/blocks (-> (conj (vec (:selection/blocks @state)) block)
+         :selection/blocks (-> (remove #(= block %) (get-selection-blocks))
                                util/sort-by-height
-                               vec)
-         :selection/direction direction))
+                               vec)))
 
 (defn drop-last-selection-block!
   []
@@ -1364,14 +1389,15 @@ Similar to re-frame subscriptions"
            input (medley/filter-vals
                    #(not (nil? %1))
                    {:modal/id            id
-                    :modal/label         (or label (if center? "ls-modal-align-center" ""))
+                    :modal/label         (if label (name label) "")
+                    :modal/class         (if center? "as-center" "")
                     :modal/payload       payload
                     :modal/show?         (if (boolean? show?) show? true)
                     :modal/panel-content panel-content
                     :modal/close-btn?    close-btn?
                     :modal/close-backdrop? (if (boolean? close-backdrop?) close-backdrop? true)})]
        (swap! state update-in
-              [:modal/subsets (or idx (count modals))]
+         [:modal/subsets (or idx (count modals))]
               merge input)
        (:modal/subsets @state)))))
 
@@ -1395,7 +1421,7 @@ Similar to re-frame subscriptions"
    (set-modal! modal-panel-content
                {:fullscreen? false
                 :close-btn?  true}))
-  ([modal-panel-content {:keys [id label payload fullscreen? close-btn? close-backdrop? center?]}]
+  ([modal-panel-content {:keys [id label payload fullscreen? close-btn? close-backdrop? center? panel?]}]
    (let [opened? (modal-opened?)]
      (when opened?
        (close-modal!))
@@ -1407,11 +1433,13 @@ Similar to re-frame subscriptions"
          (<! (async/timeout 100)))
        (swap! state assoc
               :modal/id id
-              :modal/label (or label (if center? "ls-modal-align-center" ""))
+              :modal/label (if label (name label) "")
+              :modal/class (if center? "as-center" "")
               :modal/show? (boolean modal-panel-content)
               :modal/panel-content modal-panel-content
               :modal/payload payload
               :modal/fullscreen? fullscreen?
+              :modal/panel? (if (boolean? panel?) panel? true)
               :modal/close-btn? close-btn?
               :modal/close-backdrop? (if (boolean? close-backdrop?) close-backdrop? true))))
    nil))
@@ -1907,6 +1935,10 @@ Similar to re-frame subscriptions"
   []
   (false? (sub [:electron/user-cfgs :git/disable-auto-commit?])))
 
+(defn get-git-commit-on-close-enabled?
+  []
+  (sub [:electron/user-cfgs :git/commit-on-close?]))
+
 (defn set-last-key-code!
   [key-code]
   (set-state! :editor/last-key-code key-code))
@@ -2188,6 +2220,34 @@ Similar to re-frame subscriptions"
 (defn clear-user-info!
   []
   (storage/remove :user-groups))
+
+(defn get-color-accent []
+  (get @state :ui/radix-color))
+
+(defn set-color-accent! [color]
+  (swap! state assoc :ui/radix-color color)
+  (storage/set :ui/radix-color color)
+  (util/set-android-theme))
+
+(defn unset-color-accent! []
+  (swap! state assoc :ui/radix-color :logseq)
+  (storage/remove :ui/radix-color)
+  (util/set-android-theme))
+
+(defn handbook-open?
+  []
+  (:ui/handbooks-open? @state))
+
+(defn get-handbook-route-chan
+  []
+  (:handbook/route-chan @state))
+
+(defn open-handbook-pane!
+  [k]
+  (when-not (handbook-open?)
+    (set-state! :ui/handbooks-open? true))
+  (js/setTimeout #(async/go
+                    (>! (get-handbook-route-chan) k))))
 
 (defn set-page-properties-changed!
   [page-name]

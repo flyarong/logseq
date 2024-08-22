@@ -116,7 +116,7 @@
   #{:doc :docx :xls :xlsx :ppt :pptx :one :pdf :epub})
 
 (def image-formats
-  #{:png :jpg :jpeg :bmp :gif :webp :svg})
+  #{:png :jpg :jpeg :bmp :gif :webp :svg :heic})
 
 (def audio-formats
   #{:mp3 :ogg :mpeg :wav :m4a :flac :wma :aac})
@@ -124,7 +124,7 @@
 (def video-formats
   #{:mp4 :webm :mov :flv :avi :mkv})
 
-(def media-formats (set/union (gp-config/img-formats) audio-formats))
+(def media-formats (set/union (gp-config/img-formats) audio-formats video-formats))
 
 (defn extname-of-supported?
   ([input] (extname-of-supported?
@@ -438,10 +438,7 @@
 
 (defn get-repo-fpath
   [repo-url path]
-  (if (and (or (util/electron?) (mobile-util/native-platform?))
-           (local-db? repo-url))
-    (path/path-join (get-repo-dir repo-url) path)
-    (util/node-path.join (get-repo-dir repo-url) path)))
+  (path/path-join (get-repo-dir repo-url) path))
 
 (defn get-repo-config-path
   []

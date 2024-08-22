@@ -52,7 +52,7 @@
     (boolean (text-util/get-matched-video url))
     (util/format "{{video %s}}" url)
 
-    (string/includes? url "twitter.com")
+    (or (string/includes? url "twitter.com") (string/includes? url "x.com"))
     (util/format "{{twitter %s}}" url)))
 
 (defn- try-parse-as-json
@@ -160,14 +160,14 @@
                                          nil)))]
                         (if (string/blank? result) nil result))
             text-blocks? (if (= format :markdown) markdown-blocks? org-blocks?)
-            blocks? (text-blocks? text)
             text' (or html-text
                       (when (gp-util/url? text)
                         (wrap-macro-url text))
-                      text)]
+                      text)
+            blocks? (text-blocks? text')]
         (cond
           blocks?
-          (paste-text-parseable format text)
+          (paste-text-parseable format text')
 
           (util/safe-re-find #"(?:\r?\n){2,}" text')
           (paste-segmented-text format text')
